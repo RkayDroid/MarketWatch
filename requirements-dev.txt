@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+# starlette's TestClient needs an httpx-compatible client
+httpx>=0.27

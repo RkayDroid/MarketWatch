@@ -1,11 +1,18 @@
 from datetime import datetime
 from fastapi import FastAPI
-from stock_router import router as stock_router
+from stock_router import cache_router, router as stock_router
 import pytz
 
-app = FastAPI(title="Timezone API", version="1.0.0")
-# Include the stock router
+app = FastAPI(
+    title="Market Watch Lite API",
+    version="1.1.0",
+    description=(
+        "Stock snapshot, price history and high/low data backed by yfinance, "
+        "with caching and rate limiting to stay inside Yahoo Finance's free-tier budget."
+    ),
+)
 app.include_router(stock_router)
+app.include_router(cache_router)
 MAJOR_TIMEZONES = [
     "UTC",
     "America/New_York",

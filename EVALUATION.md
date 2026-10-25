@@ -1,0 +1,300 @@
+# Market Watch Lite — Evaluation & New Endpoint
+
+## 1. Project as found
+
+```
+main.py           FastAPI app, timezone endpoints + mounts stock_router
+stock_router.py   /stock/{ticker}            -> yf.Ticker(ticker).info
+                  /stock/{ticker}/history    -> yf.Ticker(ticker).history(period=...)
+mainxx.py         Leftover PyCharm scaffold file, unused, dead code
+requirements.txt  Broken: pinned exact versions of *transitive* packages,
+                  including a non-existent certifi version, so
+                  `pip install -r requirements.txt` failed outright.
+```
+
+Issues identified:
+
+1. **No caching.** Every single HTTP request to `/stock/...` triggers a brand
+   new call to Yahoo Finance via `yfinance`, even if the previous request was
+   a second ago for the same ticker. Any real traffic (a dashboard
+   auto-refreshing, several users watching the same symbol, a retry loop on
+   the client, etc.) multiplies 1:1 into Yahoo requests.
+2. **No rate limiting / no backoff.** There is nothing to stop the app from
+   exceeding Yahoo's informal free-tier ceiling (~2000 requests/hour per
+   source IP), after which Yahoo starts returning HTTP 429s and `yfinance`
+   raises `YFRateLimitError`. The existing code treats that the same as any
+   other error (generic HTTP 400), so a caller has no idea they've been
+   throttled or when to retry.
+3. **No endpoint for "last 24h hourly" data** — this is the feature requested.
+4. **Broken `requirements.txt`** (see above) — could not `pip install` at all
+   in a clean environment.
+5. `stock_router.py` and `main.py` catch broad `Exception` and always return
+   `400`, even for upstream outages (should be `502`/`429`/`404` depending on
+   cause).
+
+## 2. yfinance options evaluated
+
+I inspected the installed `yfinance` source directly (no outbound internet
+in this sandbox) to confirm behaviour rather than relying on memory of the
+docs. Key findings, with file references from the installed package:
+
+| Need | API | Notes |
+|---|---|---|
+| Historical / intraday OHLC bars | `Ticker.history(period=, interval=)` | Backed by Yahoo's `GET /v8/finance/chart/{symbol}` (`yfinance/scrapers/history.py:276`). **One symbol per HTTP call — no batch/multi-symbol support.** |
+| Convenience multi-ticker history | `yf.download([...])` / `yf.Tickers("A B C").history()` | Still fans out to **one chart-endpoint HTTP request per ticker**, just run concurrently via a thread pool (`yfinance/multi.py`, `yfinance/tickers.py`). It reduces *wall-clock time*, not the number of requests counted against Yahoo's per-IP quota. |
+| Full fundamentals snapshot | `Ticker.info` | Most expensive single-symbol call: internally hits `quoteSummary` (`/v10/finance/quoteSummary/{symbol}`) **and** the quote endpoint (`/v7/finance/quote`) to backfill a couple of fields (`yfinance/scrapers/quote.py:660,671`). Two upstream requests per call. |
+| Lightweight "latest price" | `Ticker.fast_info` | Cheaper alternative to `.info` when only the latest price/previous close/day range is needed — avoids the heavy `quoteSummary` payload. Still one symbol per call. |
+| Multi-symbol *quotes* (snapshot, not history) | Yahoo's `GET /v7/finance/quote?symbols=A,B,C` | This is the **one Yahoo endpoint that genuinely supports many tickers in a single HTTP call** (confirmed in `yfinance/scrapers/quote.py:671`, where yfinance itself calls it with a single symbol, but the endpoint accepts a comma-separated list). It only returns a point-in-time snapshot (price, bid/ask, day high/low, market cap, etc.) — **not** a time series, so it cannot serve the "last 24h hourly" requirement, but it is the right tool for a future "current price for a watchlist" endpoint, since N tickers would cost 1 request instead of N. |
+| Built-in 429 handling | `yfinance.exceptions.YFRateLimitError` | yfinance already detects Yahoo's HTTP 429 responses and raises this dedicated exception (`yfinance/data.py:276,370,506`) — the app should catch it explicitly and return a clean `429`, rather than treating it like any other error. |
+| Interval/period limits | Docstring of `Ticker.history` / `yf.download` | Valid intervals: `1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo`. `1m` bars: last 7 days only. All other sub-daily intervals (including the `60m`/`1h` bars we need): last 60 days only. This comfortably covers a rolling 24h window. |
+| Min/Max over a period | No separate endpoint needed | `history()` already returns `High`/`Low`/`Close` columns for every bar in the requested window, so day/period max & min can be derived client-/server-side (`df['High'].max()`, `df['Low'].min()`) from data you already fetched — **no extra API call** is required just to get a min/max, unlike re-querying `.info` for `fiftyTwoWeekHigh`/`fiftyTwoWeekLow` which is a second round trip. Prefer deriving min/max from an already-fetched `history()` window over issuing a second call. |
+
+**Conclusion used for the design below:** there is no way to fetch
+*historical/intraday time-series* data for multiple tickers in a single
+Yahoo request — it is fundamentally one request per symbol. The only
+lever we have is to avoid *repeating* those per-symbol requests
+unnecessarily (caching) and to cap how many we're willing to issue overall
+(rate limiting), which is what the new endpoint implements.
+
+## 3. Rate-limit budget design
+
+Given the stated free-tier ceiling of **2000 requests/hour**, the app now:
+
+1. **Caches** every upstream (`yfinance`) response in-process for
+   `CACHE_TTL_SECONDS = 300` (5 minutes). Hourly bars only update about once
+   a minute upstream and the free data feed itself is delayed, so a 5-minute
+   cache costs no real freshness while collapsing repeat requests for a
+   popular ticker into one upstream call every 5 minutes.
+2. **Rate-limits** real upstream calls with a sliding 60-minute window capped
+   at `UPSTREAM_CALL_BUDGET_PER_HOUR = 1800` (a 10% safety margin under
+   Yahoo's informal 2000/hour ceiling, leaving headroom for other traffic on
+   the same egress IP and for yfinance's own incidental calls). Once the
+   budget for the hour is spent, the API immediately returns
+   `429 Too Many Requests` with a `Retry-After`-style message instead of
+   continuing to hammer Yahoo (which risks a temporary IP-level ban).
+3. Distinguishes `429` (rate limited — either locally or by Yahoo),
+   `404` (symbol/ticker has no data), and `502` (unexpected `yfinance`
+   error), instead of flattening everything to `400`.
+
+**Worst-case math:** with a 5-minute cache TTL, each cached *source frame*
+costs at most `60 / 5 = 12` upstream calls/hour no matter how often it is
+requested. A symbol has 5 source frames (see README "Upstream request
+budget") = 6 requests, so ~72 requests/hour if every view of it is polled
+continuously, or 12/hour for a single view. At the 1800/hour budget that is
+~25 symbols across every view or ~150 symbols on one view before the
+limiter ever engages. If more is needed, increase `CACHE_TTL_SECONDS` or
+move to a scheduled background refresher (see "Future work").
+
+Both primitives (`TTLCache`, `SlidingWindowRateLimiter`) live in
+`rate_limit.py`, are dependency-free (stdlib only), and are process-local —
+see the docstring there for how to swap in a shared store (e.g. Redis) if
+this is ever scaled to multiple workers/instances, since the budget should
+then be tracked globally rather than per-process.
+
+## 4. API (current state)
+
+The full reference lives in **README.md**. The API was consolidated into
+three buckets; this section records the design decisions and what changed.
+
+| endpoint | status |
+|---|---|
+| `GET /stock/{symbol}` | **reshaped** to a fixed 10-field snapshot (`ticker, sector, fulldayPrice, currency, symbol, language, longName, exchange, market, displayName`) instead of dumping the whole `.info` dict |
+| `GET /stock/{symbol}/historic?period=` | **replaces** `/hourly` (now `period=DAY`) and the raw `/history` pass-through; adds WEEK/MONTH (daily), HALF_YEAR/YEAR (fortnightly), FIVE_YEAR (monthly) |
+| `GET /stock/{symbol}/highlow?period=` | unchanged contract |
+| `GET /stock/hourly/batch` | **removed** (was a bonus; not in the agreed surface — and it never saved Yahoo quota, see §2) |
+| `mainxx.py` | deleted (PyCharm scaffold, dead code) |
+
+### Snapshot decisions
+* `.info` is the only yfinance call that yields `sector` (from
+  `quoteSummary/assetProfile`); `language/market/displayName/exchange` come
+  from the `v7/finance/quote` half. It is **two** HTTP requests and is
+  charged as such to the limiter.
+* `fulldayPrice` → `regularMarketPrice` (live during the session, official
+  close after), falling back to `currentPrice` then `previousClose`. This is
+  an interpretation of the field name — easy to remap if a different Yahoo
+  field was intended.
+* `displayName`/`longName` fall back to `shortName` because ETFs and
+  many non-US listings have no `displayName`; `sector` is null for
+  ETFs/indices/funds rather than a 404.
+* A symbol is "not found" (404) when Yahoo returns none of
+  `regularMarketPrice / currentPrice / longName / shortName` — unknown
+  symbols come back from yfinance as a near-empty dict, not an error.
+
+### Historic decisions
+* **One shared 5-year daily frame per symbol** (`5y @ 1d`, ~1260 rows)
+  serves `WEEK`, `MONTH`, `HALF_YEAR`, `YEAR`, `FIVE_YEAR` *and* the four
+  long `/highlow` periods. Yahoo has no fortnightly interval and retains
+  intraday bars for only ~60 days, so daily bars are the only honest source
+  for the long windows anyway; slicing/downsampling locally means nine views
+  cost one request.
+* Fortnight = 14-calendar-day bins **anchored at the newest bar**, each
+  represented by the close of its last trading day. Anchoring at the end
+  guarantees the final record is the latest close (what a chart wants),
+  at the cost of a possible short partial bin at the old end.
+* Month = calendar month, represented by its month-end close (or the latest
+  bar for the current month).
+* The requirement text said "last six months" for `YEAR` and `FIVE_YEAR`
+  too; that was read as a copy-paste slip and implemented as 12 months and
+  5 years respectively — **please confirm**.
+* Records are `{datetime, price}` as before; `price` is the bar Close.
+  Day-or-coarser records use `YYYY-MM-DD` (consistent with `/highlow`),
+  hourly records keep the full ISO-8601 timestamp with exchange offset.
+* `window_hours` was dropped from the response in favour of `period` +
+  `interval` (`1h`, `1d`, `2wk`, `1mo`).
+
+### Highlow decisions (unchanged)
+* `high`/`low` are bar High/Low (true traded extremes), numbers not strings.
+* `DAY` = last session at 5-minute bars (fallback `5d`, last session only);
+  `WEEK` = `5d @ 60m`; longer periods slice the shared daily frame.
+
+### Two-tier cache (added later, simplified on review)
+
+First iteration had a pluggable single backend (memory *or* disk) with a
+5-minute "fresh" window inside a 7-day "retained stale" window. Review
+found the two horizons ambiguous, so it was simplified to:
+
+* `caching.py`: `MemoryLRUCache` (L1, bounded by entries) +
+  `DiskLRUCache` (L2, SQLite, bounded by bytes) composed by `TieredCache`:
+  **read memory → disk → live; write-through to both; one TTL (default
+  1 day) for everything; `clear()` empties both.** The disk tier exists
+  only to survive restarts; promotions from disk keep the entry's original
+  expiry, and expiry is persisted so restarts cannot revive expired data.
+* All bounds and the TTL are env-configured (`MWL_CACHE_TTL_SECONDS`,
+  `MWL_MEMORY_CACHE_MAX_ENTRIES`, `MWL_DISK_CACHE_MAX_MB`, `MWL_CACHE_DIR`).
+* `X-Cache` now reports the tier: `MEMORY | DISK | MISS`.
+* A flat 1-day TTL made "as of now" views stale, so the TTL is chosen
+  per cached frame: **5 minutes** for the snapshot and the two frames that
+  only serve `period=DAY` (hourly bars → `/historic`, session bars →
+  `/highlow`); **1 day** for the 5-day hourly frame and the shared 5-year
+  daily frame. Because cache keys are per source frame, the rule
+  "5 min for DAY, 1 day otherwise" falls out naturally with no
+  per-endpoint special-casing. Both TTLs are env-configurable
+  (`MWL_CACHE_SHORT_TTL_SECONDS`, `MWL_CACHE_TTL_SECONDS`).
+* Kept from the first iteration: LRU recency via a monotonic counter (a
+  frozen-clock test showed timestamp ties made SQLite eviction arbitrary)
+  and the limiter guard for `max_calls = 0` (`IndexError` → 502).
+
+### Symbols containing dots (added later)
+
+* There were **no test cases** covering dotted tickers; routing itself was
+  verified fine (Starlette path params match dots, `%2E` included).
+* Yahoo semantics: dots are native for exchange suffixes (`SAP.DE`,
+  `0700.HK`, `BARC.L` — pass-through) but US share classes are dashed on
+  Yahoo (`BRK-B`), so `BRK.B` alone returns nothing. All fetch paths
+  (chart choke point `_fetch_history` + snapshot `.info`) now retry the
+  dash form once when a dotted symbol comes back empty; the retry is
+  charged to the budget and the two spellings cache separately.
+
+## 5. Testing
+
+```
+pip install -r requirements-dev.txt
+pytest                                            # 129 offline tests, ~5s
+LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 23 opt-in tests against real Yahoo
+```
+
+**Caveat:** the sandbox this was built in has no outbound internet (DNS to
+`query2.finance.yahoo.com` fails), so the live tests were written but could
+not be executed here — run them locally. The offline suite patches
+`yfinance.Ticker` at the `stock_router.yf.Ticker` seam with a fake whose
+DataFrames replicate the real library's shape (tz-aware index named
+`Date`/`Datetime`, `int64` Volume, `Dividends`/`Stock Splits` columns,
+NaNs) and whose `.info` is a real-world subset with noise keys. Requests run
+through the full FastAPI stack including JSON rendering.
+
+### Bug found earlier: `/history` crashed with a 500 on real data
+
+Any `NaN` in a yfinance frame (the `Capital Gains` column on ETFs,
+partially-filled bars, gaps) made Starlette's JSON encoder raise
+`ValueError: Out of range float values are not JSON compliant: nan`. The
+original code had this bug; its broad `except Exception` could not catch it
+because the failure happens during response rendering. The raw `/history`
+endpoint is gone now, but the lesson is baked into every serialiser
+(`_to_points`, `_compute_extremes`): NaN bars are skipped, never emitted,
+and every endpoint test parses the body with a strict JSON parser that
+rejects `NaN` tokens.
+
+### Offline coverage (`tests/`)
+
+`test_snapshot_endpoint.py` — exact 10-key shape from a realistic `.info`
+with noise keys excluded; 2 budget slots per fetch + cache hit; price
+fallbacks (`regularMarketPrice` → `currentPrice` → `previousClose`); ETF
+with null sector and `shortName` fallback; 404 for the near-empty dict
+yfinance returns for unknown symbols; 429 when the budget can't cover both
+halves of `.info`; removed routes return 404; OpenAPI lists exactly the
+three `/stock` routes.
+
+`test_historic_endpoint.py` — default `DAY`; case-insensitive period; 422
+with zero upstream calls; DAY rolling-24h slicing/order/tz, `2d→5d` fallback
+charged twice, stale-market fallback, NaN closes skipped; WEEK/MONTH exact
+trading-day records vs the source frame; HALF_YEAR/YEAR fortnight records
+(~13/~26, ~14 days apart, each a real trading-day close, latest record is
+the latest close, all inside the window); FIVE_YEAR exactly one record per
+calendar month equal to the month-end close; all five long periods = one
+upstream call; frame shared with `/highlow`; TTL expiry; 404/429/502
+mapping.
+
+`test_highlow_endpoint.py` — exact 6-key shape; High/Low selection with bar
+timestamps; DAY session fallback; planted extremes 100/200/400 days back
+resolve differently per window; long periods = one call; NaN handling;
+`X-Cache`; 429s; route isolation.
+
+`test_ttl_policy.py` — every path × its TTL with a shared fake clock
+(expires exactly at 5 min / 1 day, never earlier; non-DAY paths survive
+hours; DAY and non-DAY TTLs for the same symbol are independent; the
+short TTL is honoured by the disk tier and kept on promotion; env
+configurability; stats report both TTLs).
+
+`test_rate_limit.py` — `SlidingWindowRateLimiter` (cap, sliding window,
+`retry_after`, zero-budget guard, thread-safety) with a fake clock.
+
+`test_caching.py` — each tier against one contract (miss/hit, stored
+`None` vs miss, TTL expiry, default 1-day TTL, `purge_expired`, `clear`,
+DataFrame round-trip, thread-safety); size bounds (memory entries, disk
+bytes, oversized single entry, deterministic LRU under a frozen clock);
+tiered behaviour (write-through, memory-first, disk fallback + promotion,
+restart survival, promotion keeps original expiry, expired entries not
+revived by restart, clear both, stats); env config + defaults;
+`get_or_fetch` (MISS → MEMORY → DISK, refetch after TTL, failures not
+cached).
+
+`test_cache_endpoints_and_dotted_tickers.py` — dotted symbols through the
+API (exchange suffixes direct, `BRK.B`→`BRK-B` fallback on historic /
+highlow / snapshot with budget accounting, distinct cache entries, 404
+after both forms fail), the tiers through the API (`X-Cache` MISS →
+MEMORY → DISK → MEMORY sequence, restart survival via disk, TTL honoured
+by both tiers, 429 when budget is exhausted and the entry has expired),
+`DELETE /cache` clearing both tiers and `GET /cache/stats`.
+
+`test_live_yfinance.py` — opt-in: snapshot for AAPL/VTI/unknown, historic
+for all six periods, "five long periods + highlow = one upstream call"
+guarantee against real Yahoo, highlow for all six periods.
+
+## 6. Other clean-ups made
+
+* `requirements.txt` rewritten: it pinned exact versions of transitive
+  dependencies (including a non-existent `certifi==2026.10.19`) so
+  `pip install -r requirements.txt` failed in a clean environment. Now
+  floor-pinned top-level dependencies only.
+* App title/description in `main.py` updated from "Timezone API".
+* `mainxx.py` (PyCharm scaffold) removed.
+
+## 7. Suggested future work
+
+* If/when a "watchlist snapshot" feature is needed: 9 of the 10 snapshot
+  fields (everything except `sector`) come from Yahoo's multi-symbol
+  `v7/finance/quote?symbols=...` endpoint (§2), which returns N symbols in
+  a single request. A batch snapshot could fetch those in one call and
+  only spend a `quoteSummary` call per symbol for `sector` (which is
+  static and could be cached for hours) — a large quota saving versus
+  `.info` per ticker. This would
+  need to bypass `yfinance`'s per-ticker wrapper and call the documented
+  query pattern directly (acceptable since it's the same endpoint yfinance
+  itself uses, just with one parameter generalized).
+* For horizontal scaling (multiple app instances/workers), move `TTLCache`
+  and `SlidingWindowRateLimiter` to a shared backend (e.g. Redis) so the
+  2000/hour budget is enforced globally, not per-process.
+* Consider a scheduled background refresher for a known watchlist (e.g.
+  every 5 minutes) so inbound API traffic is served entirely from cache and
+  decoupled from Yahoo call volume, which only then scales with
+  `number_of_tracked_tickers`, not with client request rate.
