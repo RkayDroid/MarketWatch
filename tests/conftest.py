@@ -14,7 +14,6 @@ This lets the full FastAPI request/response path (including JSON
 rendering, which is where the NaN bug lived) run without network access.
 """
 
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,12 +26,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Importing stock_router builds the real cache from env; point its disk
-# tier at a throwaway location so test runs never touch ./.cache.
-os.environ.setdefault("MWL_CACHE_DIR", os.path.join(os.environ.get("TMPDIR", "/tmp"), "mwl-test-import-cache"))
-
 import stock_router  # noqa: E402
-from caching import DiskLRUCache, MemoryLRUCache, TieredCache  # noqa: E402
 from main import app  # noqa: E402
 
 EXCHANGE_TZ = "America/New_York"
@@ -143,33 +137,17 @@ class FakeTicker:
         return FakeTicker.info_payload
 
 
-def make_tiered_cache(tmp_path, *, ttl_seconds=24 * 3600, time_fn=None, memory_max=512, disk_max_bytes=256 * 1024 * 1024, name="cache.sqlite"):
-    """A fresh two-tier cache whose disk file lives under tmp_path."""
-    import time as _time
-
-    time_fn = time_fn or _time.time
-    return TieredCache(
-        memory=MemoryLRUCache(max_entries=memory_max, ttl_seconds=ttl_seconds, time_fn=time_fn),
-        disk=DiskLRUCache(path=str(tmp_path / name), max_bytes=disk_max_bytes, ttl_seconds=ttl_seconds, time_fn=time_fn),
-    )
-
-
 @pytest.fixture(autouse=True)
-def fake_yfinance(monkeypatch, request, tmp_path):
-    """Patch yfinance + reset cache/limiter state before every test.
+def fake_yfinance(monkeypatch, request):
+    """Patch yfinance + reset limiter state before every test.
 
     Tests marked ``@pytest.mark.live`` are NOT patched: they hit the real
     Yahoo Finance API and are skipped unless LIVE_YF=1 is set.
     """
     if "live" in request.keywords:
-        stock_router._cache.clear()
         stock_router._limiter._calls.clear()
         yield None
         return
-
-    # A fresh two-tier cache per test (disk tier in tmp_path): isolation.
-    cache = make_tiered_cache(tmp_path)
-    monkeypatch.setattr(stock_router, "_cache", cache)
 
     FakeTicker.responses = {}
     FakeTicker.window_responses = None
@@ -179,11 +157,9 @@ def fake_yfinance(monkeypatch, request, tmp_path):
     FakeTicker.calls = []
     monkeypatch.setattr(stock_router.yf, "Ticker", FakeTicker)
 
-    stock_router._cache.clear()
     stock_router._limiter._calls.clear()
     monkeypatch.setattr(stock_router._limiter, "max_calls", stock_router.UPSTREAM_CALL_BUDGET_PER_HOUR)
     yield FakeTicker
-    cache.close()
 
 
 @pytest.fixture

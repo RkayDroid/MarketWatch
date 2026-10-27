@@ -1,15 +1,15 @@
 """
 Process-wide rate limiting for upstream yfinance/Yahoo calls.
 
-``SlidingWindowRateLimiter`` tracks how many *real* upstream HTTP calls
-were made (cache hits never count) in the trailing 60 minutes and refuses
-new ones once a configurable budget is reached. This protects the process
-(and the IP it runs on) from crossing Yahoo's informal free-tier ceiling
-of ~2000 requests/hour, regardless of how many clients hit our own API.
+``SlidingWindowRateLimiter`` tracks how many upstream HTTP calls were made
+in the trailing 60 minutes and refuses new ones once a configurable budget
+is reached. This protects the process (and the IP it runs on) from
+crossing Yahoo's informal free-tier ceiling of ~2000 requests/hour,
+regardless of how many clients hit our own API.
 
-Caching lives in ``caching.py``. Both are process-local; for multiple
-workers/instances back them with a shared store (e.g. Redis) so the
-budget and cache are global rather than per-process.
+The limiter is process-local; for multiple workers/instances back it with
+a shared store (e.g. Redis) so the budget is global rather than
+per-process.
 """
 
 from __future__ import annotations

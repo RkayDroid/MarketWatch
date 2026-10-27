@@ -52,20 +52,19 @@ def test_snapshot_has_exact_shape_and_values(client, fake_yfinance):
         "market": "us_market",
         "displayName": "Apple",
     }
-    assert resp.headers["X-Cache"] == "MISS"
+    assert "X-Cache" not in resp.headers  # nothing is cached
 
 
-def test_snapshot_charges_two_upstream_calls_and_is_cached(client, fake_yfinance):
+def test_snapshot_charges_two_upstream_calls_every_time(client, fake_yfinance):
     fake_yfinance.info_payload = AAPL_INFO
     before = stock_router._limiter.remaining()
 
     client.get("/stock/AAPL")
     after_first = stock_router._limiter.remaining()
-    second = client.get("/stock/AAPL")
+    client.get("/stock/AAPL")
 
     assert before - after_first == 2, "yfinance .info = quoteSummary + quote = 2 HTTP requests"
-    assert second.headers["X-Cache"] == "MEMORY"
-    assert stock_router._limiter.remaining() == after_first
+    assert after_first - stock_router._limiter.remaining() == 2, "no cache: the second call pays again"
 
 
 def test_snapshot_price_fallbacks(client, fake_yfinance):
@@ -74,7 +73,6 @@ def test_snapshot_price_fallbacks(client, fake_yfinance):
     fake_yfinance.info_payload = info
     assert client.get("/stock/AAPL").json()["fulldayPrice"] == 347.7  # currentPrice
 
-    stock_router._cache.clear()
     del info["currentPrice"]
     assert client.get("/stock/AAPL").json()["fulldayPrice"] == 345.1  # previousClose
 
@@ -103,7 +101,6 @@ def test_snapshot_404_for_unknown_ticker(client, fake_yfinance):
     fake_yfinance.info_payload = {"trailingPegRatio": None}
     assert client.get("/stock/NOPE123").status_code == 404
 
-    stock_router._cache.clear()
     fake_yfinance.info_payload = {}
     assert client.get("/stock/NOPE123").status_code == 404
 

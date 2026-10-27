@@ -1,67 +1,44 @@
 """
 Stock endpoints.
 
-    GET /stock/{symbol}                     snapshot: name, sector, price, exchange...
-    GET /stock/{symbol}/historic?period=    price series (hourly / daily / fortnightly / monthly)
-                          &referenceDate=    ...the same window ending ON that date instead of now
-    GET /stock/{symbol}/highlow?period=     highest & lowest traded price and when
+    GET /stock/{symbol}                         snapshot: name, sector, price, exchange...
+    GET /stock/{symbol}/historic?period=        price series (hourly / daily / fortnightly / monthly)
+                              &referenceDate=   ...the same window ending ON that date instead of now
+    GET /stock/{symbol}/highlow?period=         highest & lowest traded price and when
 
-All Yahoo Finance access goes through one cache + one rate limiter (see
-`rate_limit.py`) so the whole app stays under yfinance's informal free-tier
-budget of ~2000 requests/hour. See README.md for the per-endpoint upstream
-cost table.
+There is NO caching in this version: every request is exactly one live
+yfinance chart call (two for `.info`, plus one retry for dotted symbols),
+so what a client asks for maps 1:1 onto Yahoo Finance traffic. A caching
+layer is deliberately deferred until the use cases are settled. The only
+protection is the sliding-window rate limiter in `rate_limit.py`, which
+hard-caps upstream calls per hour and answers 429 beyond that.
 """
 
-import os
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
-from fastapi import APIRouter, HTTPException, Query, Response
-from yfinance.exceptions import YFException, YFRateLimitError
+from fastapi import APIRouter, HTTPException, Query
+from yfinance.exceptions import YFException, YFRateLimitError, YFTickerMissingError
 
-from caching import get_or_fetch, make_cache_from_env
 from rate_limit import RateLimitExceeded, SlidingWindowRateLimiter
 
 router = APIRouter(prefix="/stock", tags=["Stock Data"])
-cache_router = APIRouter(prefix="/cache", tags=["Cache Admin"])
 
 # --------------------------------------------------------------------------
-# Rate limiting / caching configuration
+# Upstream budget
 #
 # yfinance talks to Yahoo Finance's free, unauthenticated endpoints, which
 # are informally capped around 2000 requests/hour per source IP. Every
-# upstream call made by this module is funneled through:
-#
-#   1. A two-tier cache (caching.py): memory first, then a disk tier that
-#      survives restarts; write-through; each tier bounded and LRU-evicted.
-#      Every response says where it came from: X-Cache: MEMORY | DISK | MISS.
-#
-#      Two TTLs, chosen per cached source frame:
-#        SHORT (5 min, MWL_CACHE_SHORT_TTL_SECONDS) for "as of now" data:
-#          the snapshot, and the frames that only serve period=DAY
-#          (hourly bars for /historic, 5-minute session bars for /highlow).
-#        LONG  (1 day, MWL_CACHE_TTL_SECONDS) for everything else: the
-#          5-day hourly frame (/highlow WEEK) and the shared 5-year daily
-#          frame (/historic WEEK..FIVE_YEAR, /highlow MONTH..FIVE_YEAR).
-#
-#   2. A sliding-window rate limiter (UPSTREAM_CALL_BUDGET_PER_HOUR) that
-#      hard-caps real upstream calls in any trailing 60 minutes, leaving
-#      headroom under Yahoo's ceiling for other traffic on the same IP.
-#
-# Worst case per symbol: the three short-lived frames cost at most 12
-# calls/hour each (4 requests: hourly, session, .info x2 = 48/hour), the
-# long-lived ones at most 2/day.
+# upstream call made by this module acquires a slot from the limiter first;
+# when the hourly budget is gone the API answers 429 immediately instead
+# of hammering Yahoo and risking an IP block.
 # --------------------------------------------------------------------------
 UPSTREAM_CALL_BUDGET_PER_HOUR = 1800  # 10% safety margin under the 2000/hr informal cap
 
-_cache = make_cache_from_env()
 _limiter = SlidingWindowRateLimiter(max_calls=UPSTREAM_CALL_BUDGET_PER_HOUR, window_seconds=3600)
-
-SHORT_TTL_SECONDS = float(os.environ.get("MWL_CACHE_SHORT_TTL_SECONDS", 300))  # 5 minutes
-LONG_TTL_SECONDS = _cache.ttl_seconds  # MWL_CACHE_TTL_SECONDS, default 1 day
 
 
 class Period(str, Enum):
@@ -84,8 +61,9 @@ class Period(str, Enum):
         return None
 
 
-# Calendar-day look-back used to slice the shared daily frame.
+# Calendar-day length of each period's window.
 _LOOKBACK_DAYS = {
+    Period.DAY: 1,
     Period.WEEK: 7,
     Period.MONTH: 30,
     Period.HALF_YEAR: 182,
@@ -93,61 +71,43 @@ _LOOKBACK_DAYS = {
     Period.FIVE_YEAR: 5 * 365 + 2,
 }
 
-# --------------------------------------------------------------------------
-# Source frames (each = exactly one Yahoo chart call per ticker, cached)
-#
-#   hourly   2d @ 60m  (fallback 5d)   -> /historic DAY
-#   session  1d @ 5m   (fallback 5d)   -> /highlow DAY
-#   week     5d @ 60m                  -> /highlow WEEK
-#   daily5y  5y @ 1d                   -> /historic WEEK..FIVE_YEAR and
-#                                         /highlow MONTH..FIVE_YEAR
-#
-# /historic with referenceDate= is NOT served from these frames: it makes
-# one direct, uncached chart call for exactly the requested window (see
-# _fetch_window). Caching for that path is deliberately left out until the
-# behaviour is settled.
-#
-# Yahoo's chart endpoint accepts ONE symbol per request and retains
-# intraday bars for a limited time only (~60 days for sub-hourly, 730 days
-# for hourly), so daily bars are the only option for the longer windows
-# anyway. Fetching the longest daily window once and
-# slicing/downsampling it locally means nine different period views of a
-# ticker share a single upstream request.
-# --------------------------------------------------------------------------
+# Smallest standard Yahoo range that covers each daily-bar window (Yahoo
+# only accepts 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max). The frame is then
+# sliced to the exact look-back locally.
+_DAILY_YAHOO_RANGE = {
+    Period.WEEK: "1mo",
+    Period.MONTH: "3mo",
+    Period.HALF_YEAR: "1y",
+    Period.YEAR: "2y",
+    Period.FIVE_YEAR: "5y",
+}
+
 HOURLY_INTERVAL = "60m"
 PRIMARY_HOURLY_PERIOD = "2d"
 FALLBACK_PERIOD = "5d"
 SESSION_INTERVAL = "5m"
-DAILY_RANGE = ("5y", "1d")
+DAILY_INTERVAL = "1d"
 
 # Yahoo keeps hourly bars for ~730 days only (yfinance encodes the same
 # limit), so a DAY window ending earlier than that can never be served and
 # is rejected (422) before any upstream call.
 HOURLY_RETENTION_DAYS = 730
 
-
-def _run_upstream(key: str, fetch_fn: Callable[[], object], ttl_seconds: float):
-    """Execute `fetch_fn` through the two-tier cache, storing the result for
-    `ttl_seconds`, and normalise failure modes (limiter exhaustion,
-    yfinance errors, anything unexpected) into HTTP errors. `fetch_fn`
-    must call `_limiter.try_acquire()` before each real HTTP request.
-
-    Returns (value, cache_status) with cache_status in MEMORY | DISK | MISS.
-    """
-    return _translate_upstream_errors(lambda: get_or_fetch(_cache, key, fetch_fn, ttl_seconds=ttl_seconds))
+# Marks a frame with the symbol Yahoo actually answered for (e.g. "BRK-B"
+# when the client asked for "BRK.B"). pandas `attrs` survive slicing.
+YAHOO_SYMBOL_ATTR = "yahoo_symbol"
 
 
-def _run_upstream_uncached(fetch_fn: Callable[[], object]):
-    """Execute `fetch_fn` live, bypassing the cache entirely (nothing is
-    read from or written to either tier), with the same error mapping as
-    `_run_upstream`. The rate limiter still applies. Returns
-    (value, "MISS")."""
-    return _translate_upstream_errors(fetch_fn), "MISS"
-
-
-def _translate_upstream_errors(call: Callable[[], object]):
+# --------------------------------------------------------------------------
+# Upstream access: one choke point for error mapping, one for chart calls
+# --------------------------------------------------------------------------
+def _upstream(fetch_fn: Callable[[], object]):
+    """Run a live upstream fetch and normalise its failure modes (limiter
+    exhaustion, yfinance errors, anything unexpected) into HTTP errors.
+    `fetch_fn` must call `_limiter.try_acquire()` before each real HTTP
+    request."""
     try:
-        return call()
+        return fetch_fn()
     except RateLimitExceeded as exc:
         raise HTTPException(
             status_code=429,
@@ -170,8 +130,7 @@ def _translate_upstream_errors(call: Callable[[], object]):
 
 
 def _fetch_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """Single yfinance chart call for a Yahoo range (e.g. "5y"), charged to
-    the rate limiter.
+    """One chart call for a Yahoo range (e.g. "5y"), charged to the limiter.
 
     Dotted symbols: Yahoo uses dots for exchange suffixes (SAP.DE, 0700.HK,
     BARC.L) - those work as-is - but expects a DASH for US share classes
@@ -183,23 +142,64 @@ def _fetch_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
 
 
 def _fetch_window(ticker: str, first_day: date, day_after_last: date, interval: str) -> pd.DataFrame:
-    """Single yfinance chart call for an explicit date window, charged to
-    the rate limiter. yfinance treats naive dates as midnight in the
-    exchange's time zone, `start` inclusive and `end` exclusive, so the
-    call returns exactly the calendar days [first_day, day_after_last).
-    Same dotted-symbol retry as `_fetch_history`."""
+    """One chart call for an explicit date window, charged to the limiter.
+    yfinance treats naive dates as midnight in the exchange's time zone,
+    `start` inclusive and `end` exclusive, so the call returns exactly the
+    calendar days [first_day, day_after_last). Same dotted-symbol retry as
+    `_fetch_history`."""
     return _fetch_chart(ticker, start=first_day, end=day_after_last, interval=interval)
 
 
 def _fetch_chart(ticker: str, **history_kwargs) -> pd.DataFrame:
-    _limiter.try_acquire()
-    df = yf.Ticker(ticker).history(auto_adjust=True, **history_kwargs)
-    if df.empty and "." in ticker:
-        _limiter.try_acquire()
-        df = yf.Ticker(ticker.replace(".", "-")).history(auto_adjust=True, **history_kwargs)
+    """One `Ticker.history(...)` call plus the dotted->dashed retry. The
+    returned frame carries the symbol that produced it in
+    `df.attrs[YAHOO_SYMBOL_ATTR]`."""
+    df = _history_or_missing(ticker, history_kwargs)
+    if df is None or df.empty:
+        if "." in ticker:
+            dashed = ticker.replace(".", "-")
+            df = _history_or_missing(dashed, history_kwargs)
+            if df is not None and not df.empty:
+                df.attrs[YAHOO_SYMBOL_ATTR] = dashed
+                return df
+        df = _empty_chart()
+    df.attrs[YAHOO_SYMBOL_ATTR] = ticker
     return df
 
 
+def _history_or_missing(symbol: str, history_kwargs: dict) -> Optional[pd.DataFrame]:
+    """Charged `history()` call. Returns None when yfinance reports the
+    symbol as unknown by RAISING rather than by returning an empty frame
+    (it does that when `yf.config.debug.hide_exceptions` is False), so
+    callers treat both signals the same way. Anything else propagates."""
+    _limiter.try_acquire()
+    try:
+        return yf.Ticker(symbol).history(auto_adjust=True, **history_kwargs)
+    except YFTickerMissingError:
+        return None
+
+
+def _empty_chart() -> pd.DataFrame:
+    return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+
+def _yahoo_symbol(df: pd.DataFrame, ticker: str) -> str:
+    """The symbol Yahoo answered for (dash form for US share classes)."""
+    return df.attrs.get(YAHOO_SYMBOL_ATTR, ticker)
+
+
+# --------------------------------------------------------------------------
+# Source frames (each = one chart call per request)
+#
+#   hourly   2d @ 60m  (fallback 5d)   -> /historic DAY
+#   session  1d @ 5m   (fallback 5d)   -> /highlow DAY
+#   week     5d @ 60m                  -> /highlow WEEK
+#   daily    <range> @ 1d              -> /historic and /highlow, daily periods
+#
+# Yahoo's chart endpoint accepts ONE symbol per request and retains
+# intraday bars for a limited time only (~60 days for sub-hourly, 730 days
+# for hourly), so daily bars are the only option for the longer windows.
+# --------------------------------------------------------------------------
 def _fetch_hourly_frame(ticker: str) -> pd.DataFrame:
     """Hourly bars covering at least the last 24h. A 2-day window is used
     (not 1d) so a full 24h is available right after the open; if it is
@@ -224,28 +224,14 @@ def _fetch_last_session_frame(ticker: str) -> pd.DataFrame:
     return df
 
 
-def _get_hourly_frame(ticker: str) -> Tuple[pd.DataFrame, str]:
-    """Only serves period=DAY -> short TTL."""
-    return _run_upstream(f"src:{ticker}:hourly", lambda: _fetch_hourly_frame(ticker), SHORT_TTL_SECONDS)
+def _fetch_week_intraday_frame(ticker: str) -> pd.DataFrame:
+    return _fetch_history(ticker, FALLBACK_PERIOD, HOURLY_INTERVAL)
 
 
-def _get_session_frame(ticker: str) -> Tuple[pd.DataFrame, str]:
-    """Only serves period=DAY -> short TTL."""
-    return _run_upstream(f"src:{ticker}:session", lambda: _fetch_last_session_frame(ticker), SHORT_TTL_SECONDS)
-
-
-def _get_week_intraday_frame(ticker: str) -> Tuple[pd.DataFrame, str]:
-    return _run_upstream(
-        f"src:{ticker}:5d:60m", lambda: _fetch_history(ticker, "5d", HOURLY_INTERVAL), LONG_TTL_SECONDS
-    )
-
-
-def _get_daily_frame(ticker: str) -> Tuple[pd.DataFrame, str]:
-    """The shared 5-year daily frame (~1260 rows)."""
-    yf_period, interval = DAILY_RANGE
-    return _run_upstream(
-        f"src:{ticker}:daily5y", lambda: _fetch_history(ticker, yf_period, interval), LONG_TTL_SECONDS
-    )
+def _fetch_daily_frame(ticker: str, period: Period) -> pd.DataFrame:
+    """Daily bars covering `period`'s look-back, sliced to it exactly."""
+    df = _fetch_history(ticker, _DAILY_YAHOO_RANGE[period], DAILY_INTERVAL)
+    return _slice_lookback(df, _LOOKBACK_DAYS[period])
 
 
 def _slice_lookback(df: pd.DataFrame, days: int) -> pd.DataFrame:
@@ -364,7 +350,7 @@ def _build_snapshot(ticker: str, info: dict) -> dict:
 
 
 @router.get("/{ticker}")
-def get_stock_snapshot(ticker: str, response: Response):
+def get_stock_snapshot(ticker: str):
     """Current snapshot of a symbol.
 
     Response::
@@ -387,8 +373,8 @@ def get_stock_snapshot(ticker: str, response: Response):
       `currentPrice` then `previousClose`.
     * `sector` comes from Yahoo's company profile; it is null for ETFs,
       indices and funds. `displayName` falls back to `shortName`.
-    * Upstream cost: 2 requests (yfinance `.info` = quoteSummary + quote),
-      cached for the SHORT TTL (5 min). Cache tier in the `X-Cache` header.
+    * Upstream cost: 2 requests per call (yfinance `.info` = quoteSummary
+      + quote); 4 if a dotted symbol has to be retried in dash form.
     """
     ticker = ticker.upper()
 
@@ -407,65 +393,56 @@ def get_stock_snapshot(ticker: str, response: Response):
             return None
         return _build_snapshot(ticker, info)
 
-    snapshot, cache_status = _run_upstream(f"snapshot:{ticker}", fetch, SHORT_TTL_SECONDS)
+    snapshot = _upstream(fetch)
     if snapshot is None:
         raise HTTPException(status_code=404, detail=f"Ticker {ticker} not found.")
-    response.headers["X-Cache"] = cache_status
     return snapshot
 
 
 # ==========================================================================
 # GET /stock/{symbol}/historic
 # ==========================================================================
-# period -> (record granularity label, lookback days, downsampler, intraday?)
+# period -> (record granularity label, downsampler)
 _HISTORIC_SPEC = {
-    Period.WEEK: ("1d", 7, None),
-    Period.MONTH: ("1d", 30, None),
-    Period.HALF_YEAR: ("2wk", 182, lambda df: _last_per_bin(df, 14)),
-    Period.YEAR: ("2wk", 365, lambda df: _last_per_bin(df, 14)),
-    Period.FIVE_YEAR: ("1mo", _LOOKBACK_DAYS[Period.FIVE_YEAR], _last_per_calendar_month),
+    Period.WEEK: ("1d", None),
+    Period.MONTH: ("1d", None),
+    Period.HALF_YEAR: ("2wk", lambda df: _last_per_bin(df, 14)),
+    Period.YEAR: ("2wk", lambda df: _last_per_bin(df, 14)),
+    Period.FIVE_YEAR: ("1mo", _last_per_calendar_month),
 }
 
 
-def _window_days(period: Period) -> int:
-    return 1 if period == Period.DAY else _HISTORIC_SPEC[period][1]
-
-
 def _historic_points(ticker: str, period: Period) -> Tuple[List[dict], str, str]:
-    """Return (points, interval_label, cache_status) for the rolling window
+    """Return (points, interval_label, yahoo_symbol) for the rolling window
     ending now."""
     if period == Period.DAY:
-        df, cache_status = _get_hourly_frame(ticker)
-        return _to_points(_last_24h(df), intraday=True), "1h", cache_status
+        df = _upstream(lambda: _fetch_hourly_frame(ticker))
+        return _to_points(_last_24h(df), intraday=True), "1h", _yahoo_symbol(df, ticker)
 
-    interval_label, lookback_days, downsample = _HISTORIC_SPEC[period]
-    df, cache_status = _get_daily_frame(ticker)
-    df = _slice_lookback(df, lookback_days)
+    interval_label, downsample = _HISTORIC_SPEC[period]
+    df = _upstream(lambda: _fetch_daily_frame(ticker, period))
     if downsample is not None and not df.empty:
         df = downsample(df)
-    return _to_points(df, intraday=False), interval_label, cache_status
+    return _to_points(df, intraday=False), interval_label, _yahoo_symbol(df, ticker)
 
 
 def _historic_points_ending_on(ticker: str, period: Period, reference_date: date) -> Tuple[List[dict], str, str]:
-    """Return (points, interval_label, cache_status) for the window of
-    `period`'s length that ENDS on `reference_date` (inclusive).
-
-    One direct, uncached chart call for exactly that window: hourly bars
-    for DAY, daily bars otherwise, then the same downsampling as the
-    rolling window. cache_status is always "MISS".
-    """
-    days = _window_days(period)
+    """Return (points, interval_label, yahoo_symbol) for the window of
+    `period`'s length that ENDS on `reference_date` (inclusive): one chart
+    call for exactly that window - hourly bars for DAY, daily bars
+    otherwise - then the same downsampling as the rolling window."""
+    days = _LOOKBACK_DAYS[period]
     first_day, day_after = _window_bounds(reference_date, days)
     if period == Period.DAY:
-        df, cache_status = _run_upstream_uncached(lambda: _fetch_window(ticker, first_day, day_after, HOURLY_INTERVAL))
-        return _to_points(_slice_window(df, reference_date, days), intraday=True), "1h", cache_status
+        df = _upstream(lambda: _fetch_window(ticker, first_day, day_after, HOURLY_INTERVAL))
+        return _to_points(_slice_window(df, reference_date, days), intraday=True), "1h", _yahoo_symbol(df, ticker)
 
-    interval_label, _, downsample = _HISTORIC_SPEC[period]
-    df, cache_status = _run_upstream_uncached(lambda: _fetch_window(ticker, first_day, day_after, "1d"))
+    interval_label, downsample = _HISTORIC_SPEC[period]
+    df = _upstream(lambda: _fetch_window(ticker, first_day, day_after, DAILY_INTERVAL))
     df = _slice_window(df, reference_date, days)
     if downsample is not None and not df.empty:
         df = downsample(df)
-    return _to_points(df, intraday=False), interval_label, cache_status
+    return _to_points(df, intraday=False), interval_label, _yahoo_symbol(df, ticker)
 
 
 def _today_utc() -> date:
@@ -499,7 +476,6 @@ def _validate_reference_date(reference_date: date, period: Period) -> None:
 @router.get("/{ticker}/historic")
 def get_historic_prices(
     ticker: str,
-    response: Response,
     period: Period = Query(Period.DAY, description="Look-back window. Case-insensitive. Default DAY."),
     reference_date: Optional[date] = Query(
         None,
@@ -530,16 +506,20 @@ def get_historic_prices(
     Response::
 
         {
-          "ticker": "AAPL",
+          "ticker": "BRK.B",
+          "symbol": "BRK-B",
           "period": "WEEK",
           "interval": "1d",
           "referenceDate": "2024-05-07",
           "count": 5,
-          "cached": false,
           "data": [ {"datetime": "2024-05-01", "price": 172.34}, ... ]
         }
 
-    `referenceDate` is null for the default rolling window.
+    `referenceDate` is null for the default rolling window. `ticker` echoes
+    the request; `symbol` is the symbol Yahoo actually answered for - they
+    differ only for US share classes typed with a dot (BRK.B -> BRK-B),
+    which are retried in Yahoo's dash form when the dotted form is unknown
+    (same rule as the snapshot endpoint).
 
     * `price` is the bar's Close. For fortnight/month records it is the
       close of the last trading day in that bin, and `datetime` is that
@@ -549,36 +529,29 @@ def get_historic_prices(
       than 24h (long weekend) the most recent 24 hourly bars are returned
       instead of an empty list. With referenceDate, a date the market was
       closed is simply 404 (there is nothing to show for that day).
-    * Upstream cost without referenceDate: DAY = one hourly call cached
-      for the SHORT TTL (5 min); WEEK..FIVE_YEAR all share one 5-year
-      daily call per ticker cached for the LONG TTL (1 day), also shared
-      with /highlow.
-    * Upstream cost with referenceDate: exactly one live chart call for
-      the requested window, NOT cached (always `cached: false`,
-      `X-Cache: MISS`); caching for this path is intentionally deferred.
-      The call still counts against the hourly budget. Impossible windows
-      (future, DAY beyond retention, malformed date) are rejected with 422
-      before any upstream call.
+    * Upstream cost: one live chart call per request (DAY may need a
+      second one on a long weekend; dotted symbols may be retried once).
+      Nothing is cached. Impossible windows (future, DAY beyond retention,
+      malformed date) are rejected with 422 before any upstream call.
     """
     ticker = ticker.upper()
     if reference_date is None:
-        points, interval_label, cache_status = _historic_points(ticker, period)
+        points, interval_label, yahoo_symbol = _historic_points(ticker, period)
     else:
         _validate_reference_date(reference_date, period)
-        points, interval_label, cache_status = _historic_points_ending_on(ticker, period, reference_date)
+        points, interval_label, yahoo_symbol = _historic_points_ending_on(ticker, period, reference_date)
     if not points:
         window = f" ending {reference_date.isoformat()}" if reference_date is not None else ""
         raise HTTPException(
             status_code=404, detail=f"No price data found for {ticker} over period {period.value}{window}."
         )
-    response.headers["X-Cache"] = cache_status
     return {
         "ticker": ticker,
+        "symbol": yahoo_symbol,
         "period": period.value,
         "interval": interval_label,
         "referenceDate": reference_date.isoformat() if reference_date is not None else None,
         "count": len(points),
-        "cached": cache_status != "MISS",
         "data": points,
     }
 
@@ -586,16 +559,13 @@ def get_historic_prices(
 # ==========================================================================
 # GET /stock/{symbol}/highlow
 # ==========================================================================
-def _load_highlow_frame(ticker: str, period: Period) -> Tuple[pd.DataFrame, str, bool]:
-    """(frame, cache_status, is_intraday) with the bars needed for `period`."""
+def _load_highlow_frame(ticker: str, period: Period) -> Tuple[pd.DataFrame, bool]:
+    """(frame, is_intraday) with the bars needed for `period`."""
     if period == Period.DAY:
-        df, cache_status = _get_session_frame(ticker)
-        return df, cache_status, True
+        return _upstream(lambda: _fetch_last_session_frame(ticker)), True
     if period == Period.WEEK:
-        df, cache_status = _get_week_intraday_frame(ticker)
-        return df, cache_status, True
-    df, cache_status = _get_daily_frame(ticker)
-    return _slice_lookback(df, _LOOKBACK_DAYS[period]), cache_status, False
+        return _upstream(lambda: _fetch_week_intraday_frame(ticker)), True
+    return _upstream(lambda: _fetch_daily_frame(ticker, period)), False
 
 
 def _compute_extremes(df: pd.DataFrame) -> Optional[dict]:
@@ -620,7 +590,6 @@ def _compute_extremes(df: pd.DataFrame) -> Optional[dict]:
 @router.get("/{ticker}/highlow")
 def get_high_low(
     ticker: str,
-    response: Response,
     period: Period = Query(Period.WEEK, description="Look-back window. Case-insensitive. Default WEEK."),
 ):
     """Highest and lowest traded price for `ticker` over the chosen period,
@@ -642,17 +611,15 @@ def get_high_low(
     * `highOccured`/`lowOccured` precision follows the bar size: DAY ->
       5-minute bar, WEEK -> hourly bar (both ISO-8601 with exchange UTC
       offset); MONTH/HALF_YEAR/YEAR/FIVE_YEAR -> date (YYYY-MM-DD).
-    * Upstream cost: DAY = one session call cached for the SHORT TTL
-      (5 min); WEEK = one call and MONTH..FIVE_YEAR share the 5-year daily
-      frame, both cached for the LONG TTL (1 day; daily frame also used by
-      /historic).
+    * Upstream cost: one live chart call per request (DAY may need a
+      second one on a weekend; dotted symbols may be retried once).
+      Nothing is cached.
     """
     ticker = ticker.upper()
-    df, cache_status, intraday = _load_highlow_frame(ticker, period)
+    df, intraday = _load_highlow_frame(ticker, period)
     extremes = _compute_extremes(df)
     if extremes is None:
         raise HTTPException(status_code=404, detail=f"No price data found for {ticker} over period {period.value}.")
-    response.headers["X-Cache"] = cache_status
     return {
         "symbol": ticker,
         "period": period.value,
@@ -664,28 +631,8 @@ def get_high_low(
 
 
 # ==========================================================================
-# Cache administration
+# Upstream budget (read-only)
 # ==========================================================================
-@cache_router.delete("")
-def clear_cache():
-    """Drop every cached entry from BOTH tiers (memory and disk). The next
-    request for anything will be a live upstream call again."""
-    cleared = _cache.clear()
-    return {"cleared": cleared, **_cache.stats()}
-
-
-@cache_router.get("/stats")
-def cache_stats():
-    """Per-tier entry counts and bounds, the TTL, and how much of the
-    hourly upstream budget is left. Expired entries are purged first so
-    the counts reflect live data."""
-    purged = _cache.purge_expired()
-    stats = _cache.stats()
-    stats.pop("ttl_seconds", None)
-    return {
-        "short_ttl_seconds": SHORT_TTL_SECONDS,
-        "long_ttl_seconds": LONG_TTL_SECONDS,
-        **stats,
-        "purged_now": purged,
-        "upstream_budget_remaining": _limiter.remaining(),
-    }
+def upstream_budget() -> dict:
+    """How much of the hourly upstream budget is left; used by /status."""
+    return {"per_hour": UPSTREAM_CALL_BUDGET_PER_HOUR, "remaining": _limiter.remaining()}

@@ -40,7 +40,7 @@ def test_live_snapshot_aapl(client):
     assert body["symbol"] == "AAPL" and body["currency"] == "USD"
     assert body["sector"] == "Technology"
     assert body["fulldayPrice"] > 0
-    assert client.get("/stock/AAPL").headers["X-Cache"] == "MEMORY"
+    assert "X-Cache" not in resp.headers
 
 
 def test_live_snapshot_etf_has_null_sector(client):
@@ -71,15 +71,14 @@ def test_live_historic_all_periods(client, period):
         assert all(len(s) == 10 for s in stamps)  # YYYY-MM-DD
 
 
-def test_live_historic_long_periods_cost_one_upstream_call(client):
+def test_live_historic_each_period_is_one_upstream_call(client):
     import stock_router
 
-    stock_router._cache.clear()
     before = stock_router._limiter.remaining()
     for period in ("WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
         assert client.get(f"/stock/MSFT/historic?period={period}").status_code == 200
     assert client.get("/stock/MSFT/highlow?period=YEAR").status_code == 200
-    assert before - stock_router._limiter.remaining() == 1
+    assert before - stock_router._limiter.remaining() == 6  # no cache: 1 per request
 
 
 def test_live_unknown_ticker_historic_is_404_not_500(client):
@@ -107,13 +106,12 @@ def test_live_historic_week_ending_on_reference_date(client):
     assert resp.status_code == 200, resp.text
     body = _strict_json(resp.text)
     assert body["referenceDate"] == reference.isoformat()
-    assert body["cached"] is False and resp.headers["X-Cache"] == "MISS"
     assert 3 <= body["count"] <= 5
     first_day = (reference - timedelta(days=6)).isoformat()
     assert all(first_day <= p["datetime"] <= reference.isoformat() for p in body["data"])
     assert body["data"][-1]["datetime"] == reference.isoformat()  # a weekday: inclusive end is present
     assert all(p["price"] > 0 for p in body["data"])
-    assert before - stock_router._limiter.remaining() == 1  # one live call, nothing cached
+    assert before - stock_router._limiter.remaining() == 1  # one live call
 
 
 def test_live_historic_day_on_a_past_date_is_that_sessions_hourly_bars(client):
@@ -166,14 +164,13 @@ def test_live_highlow_all_periods(client, period):
     datetime.fromisoformat(body["lowOccured"])
 
 
-def test_live_highlow_long_periods_cost_one_upstream_call(client):
+def test_live_highlow_each_period_is_one_upstream_call(client):
     import stock_router
 
-    stock_router._cache.clear()
     before = stock_router._limiter.remaining()
     for period in ("MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
         assert client.get(f"/stock/MSFT/highlow?period={period}").status_code == 200
-    assert before - stock_router._limiter.remaining() == 1
+    assert before - stock_router._limiter.remaining() == 4
 
 
 @pytest.mark.parametrize("symbol", ["SAP.DE", "0700.HK", "BARC.L"])

@@ -148,7 +148,7 @@ three buckets; this section records the design decisions and what changed.
 * `DAY` = last session at 5-minute bars (fallback `5d`, last session only);
   `WEEK` = `5d @ 60m`; longer periods slice the shared daily frame.
 
-### Two-tier cache (added later, simplified on review)
+### Two-tier cache (added later, simplified on review — **since removed, see "Reset" below**)
 
 First iteration had a pluggable single backend (memory *or* disk) with a
 5-minute "fresh" window inside a 7-day "retained stale" window. Review
@@ -185,8 +185,20 @@ found the two horizons ambiguous, so it was simplified to:
   (chart choke point `_fetch_history` + snapshot `.info`) now retry the
   dash form once when a dotted symbol comes back empty; the retry is
   charged to the budget and the two spellings cache separately.
+* Hardened later: the chart retry only fired on an *empty* frame, but
+  yfinance reports an unknown symbol by **raising** `YFTickerMissingError`
+  (tz / prices missing) when `yf.config.debug.hide_exceptions` is False -
+  which the orphaned `market_data.py` sets at import. In that mode
+  `BRK.B` on `/historic` became a 502 with no retry. `_fetch_chart` now
+  treats the exception and the empty frame identically. The historic
+  response also gained `symbol` (the form Yahoo answered for, carried on
+  the frame via `DataFrame.attrs` so it survives the disk cache), matching
+  the snapshot, so the translation is visible rather than implicit.
 
 ### `referenceDate` on `/historic` (added later)
+
+*(The caching remarks in this section describe the state before the
+cache was removed; the semantics are unchanged.)*
 
 Requirement: `historic?period=X&referenceDate=2026-10-23` returns the
 window of `X`'s length that **ends on that date, inclusive**.
@@ -233,11 +245,76 @@ long TTL for windows that end before today, short TTL otherwise), and/or
 serve windows inside the already-cached 5-year daily frame from it. Both
 fit the existing `_run_upstream` pattern without touching the endpoint.
 
+### Reset: cache removed, dead code deleted (latest)
+
+To level-set before designing a caching layer around a complete set of
+use cases, **all caching was removed** — the memory tier, the SQLite disk
+tier, the `/cache` admin routes, the `X-Cache` header, the `cached`
+response field and the `MWL_*` environment variables. `caching.py` is
+gone. What remains between the API and Yahoo is the rate limiter only.
+
+Consequences, and what was changed to keep the code honest without a
+cache:
+
+* **Every request is one live chart call** (two for `.info`). The
+  "shared 5-year daily frame" design only made sense when that frame was
+  cached and reused by nine views; without a cache, fetching five years of
+  daily bars to answer `WEEK` is pure waste. Each daily period now fetches
+  the **smallest standard Yahoo range that covers it** (`WEEK`→`1mo`,
+  `MONTH`→`3mo`, `HALF_YEAR`→`1y`, `YEAR`→`2y`, `FIVE_YEAR`→`5y`) and is
+  sliced to the exact look-back locally, exactly as before. Same request
+  count, far smaller payloads. `/highlow` uses the same rule.
+* `_run_upstream` / `_run_upstream_uncached` collapsed into one
+  `_upstream()` that only does error mapping; the per-frame getters became
+  plain fetch functions.
+* The remaining budget moved from `/cache/stats` to `GET /status`
+  (`upstream_budget.remaining`), since it is the only operational signal
+  left and the thing to watch for when the cache becomes necessary.
+* The `yahoo_symbol` mark on frames (`DataFrame.attrs`) stays — it is how
+  `/historic` reports `symbol`; it no longer needs to survive pickling.
+
+Dead code deleted in the same pass:
+
+* `market_data.py` — an orphaned earlier implementation of the same layer
+  (its own `TTLCache`, `RequestBudget`, single-flight `fetch()`, loaders,
+  and the old `/hourly` response builder). Nothing imported it, but it set
+  `yf.config.debug.hide_exceptions = False` at import, a global side
+  effect that would have switched yfinance to raising on unknown symbols
+  for the whole process the moment anything imported it. Two of its ideas
+  are worth revisiting when caching returns — serving stale data when the
+  budget is exhausted, and negative-caching "symbol not found" — but
+  against the new design, not by resurrecting the file.
+* `mainxx.py` (PyCharm scaffold; §6 already claimed it was gone).
+* `tests/test_hourly_endpoint.py`, `tests/test_minmax_endpoint.py`,
+  `tests/test_history_and_info_endpoints.py` — 46 tests for routes removed
+  in §4, failing ever since. `tests/test_caching.py`,
+  `tests/test_ttl_policy.py` and the cache half of
+  `test_cache_endpoints_and_dotted_tickers.py` (now
+  `test_dotted_tickers.py`) went with the cache.
+* `.DS_Store`.
+
+**Caching options recorded for the next design round** (from the review
+that preceded the reset; the numbers assume the current 1:1 mapping):
+
+| option | idea | pros | cons |
+|---|---|---|---|
+| A. per-window cache | key = symbol + interval + window bounds; long TTL for windows that end before today, short TTL otherwise | smallest change; closed windows are immutable so they could be cached for days | only identical requests benefit; scrubbing through dates is still one call per step |
+| B. reuse a cached wide daily frame | keep one 5-year daily frame per symbol and slice any daily-period window out of it; fall back to A | common case (recent daily windows) costs zero extra calls; responses unchanged | two code paths; the frame is up to a TTL stale so windows touching today need the short-TTL route |
+| C. per-symbol archives | `max@1d` (full history) and `max@60m` (Yahoo's whole 730-day hourly retention, ~3.5k rows) per symbol, 1-day TTL; everything is a local slice | hard ceiling of 2 calls/symbol/day whatever clients do | most moving parts; large entries (a 40-year daily frame ≈ 0.7 MB) so the memory bound must become byte-based |
+| D. remember symbol resolution | memoise `BRK.B → BRK-B` once learned | removes the wasted dotted attempt (which on the `start/end` path is several unmetered requests) | alias lost on restart; orthogonal to the others, cheap |
+| E. no cache (current) | rely on the limiter | simplest, always fresh | linear in request volume; ~30 API calls/minute sustained before `429` |
+
+The recommendation on record was B + D with A as the fallback inside B;
+C only if dense date-scrubbing on `DAY` turns out to be a real use case.
+Whatever is chosen should also decide: stale-on-exhausted-budget,
+negative caching of unknown symbols, and whether multi-worker deployments
+need a shared store (the limiter has the same question).
+
 ## 5. Testing
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 169 offline tests, ~15s
+pytest                                            # 110 offline tests, ~7s
 LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 27 opt-in tests against real Yahoo
 ```
 
@@ -265,7 +342,8 @@ rejects `NaN` tokens.
 ### Offline coverage (`tests/`)
 
 `test_snapshot_endpoint.py` — exact 10-key shape from a realistic `.info`
-with noise keys excluded; 2 budget slots per fetch + cache hit; price
+with noise keys excluded; 2 budget slots per fetch, paid again on every
+call (no cache); price
 fallbacks (`regularMarketPrice` → `currentPrice` → `previousClose`); ETF
 with null sector and `shortName` fallback; 404 for the near-empty dict
 yfinance returns for unknown symbols; 429 when the budget can't cover both
@@ -278,12 +356,13 @@ charged twice, stale-market fallback, NaN closes skipped; WEEK/MONTH exact
 trading-day records vs the source frame; HALF_YEAR/YEAR fortnight records
 (~13/~26, ~14 days apart, each a real trading-day close, latest record is
 the latest close, all inside the window); FIVE_YEAR exactly one record per
-calendar month equal to the month-end close; all five long periods = one
-upstream call; frame shared with `/highlow`; TTL expiry; 404/429/502
-mapping.
+calendar month equal to the month-end close; each daily period fetches
+the smallest covering Yahoo range (`1mo/3mo/1y/2y/5y`); twelve requests =
+twelve live calls (no cache); 404/429/502 mapping, including 429 with no
+cached fallback.
 
-`test_historic_reference_date.py` — `referenceDate`: echo, always
-`cached: false` / `X-Cache: MISS`; **the yfinance call is made with
+`test_historic_reference_date.py` — `referenceDate`: echo and exact
+shape; **the yfinance call is made with
 `start = referenceDate − (N−1)` and `end = referenceDate + 1` for every
 period** (the one test that pins the inclusive-end contract at the
 upstream boundary); WEEK/MONTH exact records vs the source frame, the
@@ -293,48 +372,31 @@ the window's last close as the last record; `referenceDate=today` equals
 the rolling window; **DAY**: exactly that exchange-local date's bars, DST
 day has 23/25 bars, closed day = 404 (no 24-bar fallback), NaN closes
 skipped; bars outside the window returned by upstream are dropped; **no
-caching**: three identical requests = three live calls and nothing stored,
-the rolling window's cache is neither used nor disturbed; **422 without
+caching**: three identical requests = three live calls, rolling and
+anchored windows are independent calls; **422 without
 upstream call** for future/too-old/malformed dates, `tomorrow` accepted
 for exchanges ahead of UTC; 404/429/502 mapping; `BRK.B` → `BRK-B` retry.
 
 `test_highlow_endpoint.py` — exact 6-key shape; High/Low selection with bar
 timestamps; DAY session fallback; planted extremes 100/200/400 days back
-resolve differently per window; long periods = one call; NaN handling;
-`X-Cache`; 429s; route isolation.
-
-`test_ttl_policy.py` — every path × its TTL with a shared fake clock
-(expires exactly at 5 min / 1 day, never earlier; non-DAY paths survive
-hours; DAY and non-DAY TTLs for the same symbol are independent; the
-short TTL is honoured by the disk tier and kept on promotion; env
-configurability; stats report both TTLs).
+resolve differently per window; each daily period = one call for its
+covering range, six periods = six calls; NaN handling; 429s (no cached
+fallback); route isolation.
 
 `test_rate_limit.py` — `SlidingWindowRateLimiter` (cap, sliding window,
 `retry_after`, zero-budget guard, thread-safety) with a fake clock.
 
-`test_caching.py` — each tier against one contract (miss/hit, stored
-`None` vs miss, TTL expiry, default 1-day TTL, `purge_expired`, `clear`,
-DataFrame round-trip, thread-safety); size bounds (memory entries, disk
-bytes, oversized single entry, deterministic LRU under a frozen clock);
-tiered behaviour (write-through, memory-first, disk fallback + promotion,
-restart survival, promotion keeps original expiry, expired entries not
-revived by restart, clear both, stats); env config + defaults;
-`get_or_fetch` (MISS → MEMORY → DISK, refetch after TTL, failures not
-cached).
-
-`test_cache_endpoints_and_dotted_tickers.py` — dotted symbols through the
-API (exchange suffixes direct, `BRK.B`→`BRK-B` fallback on historic /
-highlow / snapshot with budget accounting, distinct cache entries, 404
-after both forms fail), the tiers through the API (`X-Cache` MISS →
-MEMORY → DISK → MEMORY sequence, restart survival via disk, TTL honoured
-by both tiers, 429 when budget is exhausted and the entry has expired),
-`DELETE /cache` clearing both tiers and `GET /cache/stats`.
+`test_dotted_tickers.py` — dotted symbols through the API: exchange
+suffixes direct and reported unchanged, `BRK.B`→`BRK-B` fallback on
+historic / highlow / snapshot with budget accounting and `symbol`
+reporting the dashed form, the fallback also firing when yfinance raises
+instead of returning empty, 404 after both forms fail.
 
 `test_live_yfinance.py` — opt-in: snapshot for AAPL/VTI/unknown, historic
-for all six periods, "five long periods + highlow = one upstream call"
-guarantee against real Yahoo, highlow for all six periods; `referenceDate`:
+for all six periods, one upstream call per request against real Yahoo,
+highlow for all six periods; `referenceDate`:
 a WEEK ending on a past weekday (last record == referenceDate, one live
-call, nothing cached), past-date DAY sessions (6–8 hourly bars, all on
+call), past-date DAY sessions (6–8 hourly bars, all on
 that date), 422 beyond hourly retention with no call, a MONTH ending
 2015-03-31.
 
@@ -359,10 +421,14 @@ that date), 422 beyond hourly retention with no call, a MONTH ending
   need to bypass `yfinance`'s per-ticker wrapper and call the documented
   query pattern directly (acceptable since it's the same endpoint yfinance
   itself uses, just with one parameter generalized).
-* For horizontal scaling (multiple app instances/workers), move `TTLCache`
-  and `SlidingWindowRateLimiter` to a shared backend (e.g. Redis) so the
-  2000/hour budget is enforced globally, not per-process.
+* Design the caching layer (see the options table under "Reset" in §4)
+  once the use cases are complete; decide at the same time on
+  stale-on-exhausted-budget and negative caching of unknown symbols.
+* For horizontal scaling (multiple app instances/workers), move the
+  `SlidingWindowRateLimiter` (and the future cache) to a shared backend
+  (e.g. Redis) so the 2000/hour budget is enforced globally, not
+  per-process.
 * Consider a scheduled background refresher for a known watchlist (e.g.
-  every 5 minutes) so inbound API traffic is served entirely from cache and
-  decoupled from Yahoo call volume, which only then scales with
+  every 5 minutes) so inbound API traffic is served entirely from a cache
+  and decoupled from Yahoo call volume, which only then scales with
   `number_of_tracked_tickers`, not with client request rate.

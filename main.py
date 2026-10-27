@@ -1,6 +1,6 @@
 from datetime import datetime
 from fastapi import FastAPI
-from stock_router import cache_router, router as stock_router
+from stock_router import router as stock_router, upstream_budget
 import pytz
 
 app = FastAPI(
@@ -8,11 +8,10 @@ app = FastAPI(
     version="1.1.0",
     description=(
         "Stock snapshot, price history and high/low data backed by yfinance, "
-        "with caching and rate limiting to stay inside Yahoo Finance's free-tier budget."
+        "rate limited to stay inside Yahoo Finance's free-tier budget. No caching (yet)."
     ),
 )
 app.include_router(stock_router)
-app.include_router(cache_router)
 MAJOR_TIMEZONES = [
     "UTC",
     "America/New_York",
@@ -42,4 +41,4 @@ def get_all_times():
 
 @app.get("/status")
 def get_status():
-    return {"status": "online", "message": "API is running successfully"}
+    return {"status": "online", "message": "API is running successfully", "upstream_budget": upstream_budget()}

@@ -1,10 +1,11 @@
 # Market Watch Lite
 
 A small FastAPI service exposing stock data from Yahoo Finance (via
-[yfinance](https://github.com/ranaroussi/yfinance)), built to stay inside
-yfinance's informal free-tier budget of **~2000 requests/hour** through a
-two-tier (memory + disk) cache, a hard upstream rate limiter, and sharing
-one upstream fetch across as many API views as possible.
+[yfinance](https://github.com/ranaroussi/yfinance)). Every API request is
+served by a live yfinance call — **there is no caching in this version**
+(deliberately, until the use cases are settled; see *Upstream request
+budget*). A hard upstream rate limiter keeps the service inside yfinance's
+informal free-tier budget of **~2000 requests/hour**.
 
 ```
 pip install -r requirements.txt
@@ -22,8 +23,6 @@ All stock endpoints:
   invalid `period` (without spending any upstream budget), `429` when either
   our local hourly budget or Yahoo's own limiter is hit, and `502` for any
   other upstream failure — never a raw `500`;
-* report where the data came from in an `X-Cache: MEMORY | DISK | MISS`
-  response header;
 * accept Yahoo-native dotted symbols (`SAP.DE`, `0700.HK`, `BARC.L`) as-is,
   and automatically retry US share classes typed with a dot (`BRK.B`) in
   Yahoo's dash form (`BRK-B`).
@@ -57,7 +56,7 @@ All stock endpoints:
 | `longName` | `longName`, falling back to `shortName` |
 | others | passed through as-is |
 
-Upstream cost: **2 requests** (`.info` is `quoteSummary` + `quote`). **TTL: 5 minutes.**
+Upstream cost: **2 requests per call** (`.info` is `quoteSummary` + `quote`).
 
 ---
 
@@ -80,10 +79,10 @@ that date (inclusive)** — see below.
 {
   "ticker": "AAPL",
   "period": "DAY",
+  "symbol": "AAPL",
   "interval": "1h",
   "referenceDate": null,
   "count": 7,
-  "cached": false,
   "data": [
     { "datetime": "2024-05-01T09:30:00-04:00", "price": 172.34 },
     { "datetime": "2024-05-01T10:30:00-04:00", "price": 172.91 }
@@ -101,10 +100,11 @@ that date (inclusive)** — see below.
   recent 24 hourly bars are returned rather than an empty list.
 * Records exist only for trading days; weekends/holidays are absent.
 
-Upstream cost: `DAY` = 1 request (hourly bars); **`WEEK`…`FIVE_YEAR` share a
-single cached 5-year daily request per symbol**, which is also the frame
-`/highlow` uses for its longer periods.
-**TTL: 5 minutes for `DAY`, 1 day for every other period.**
+Upstream cost: **1 request per call.** `DAY` fetches 2 days of hourly bars
+(a second request falls back to 5 days on a long weekend); each daily
+period fetches the smallest standard Yahoo range that covers it
+(`WEEK`→`1mo`, `MONTH`→`3mo`, `HALF_YEAR`→`1y`, `YEAR`→`2y`,
+`FIVE_YEAR`→`5y`) and slices it to the exact look-back locally.
 
 #### `referenceDate` — end the window on a given date
 
@@ -113,11 +113,11 @@ single cached 5-year daily request per symbol**, which is also the frame
 ```json
 {
   "ticker": "AAPL",
+  "symbol": "AAPL",
   "period": "WEEK",
   "interval": "1d",
   "referenceDate": "2026-10-23",
   "count": 5,
-  "cached": false,
   "data": [
     { "datetime": "2026-10-19", "price": 172.34 },
     { "datetime": "2026-10-20", "price": 173.10 },
@@ -138,6 +138,10 @@ single cached 5-year daily request per symbol**, which is also the frame
   close on or before `referenceDate`.
 * `referenceDate` is echoed in the response and is `null` for the default
   rolling window.
+* `ticker` echoes the request; `symbol` is the symbol Yahoo actually
+  answered for. They differ only for US share classes typed with a dot
+  (`/stock/BRK.B/historic` → `"ticker": "BRK.B", "symbol": "BRK-B"`), the
+  same rule the snapshot endpoint applies.
 * `DAY` with a `referenceDate` on which the market was closed is a `404`
   (there is nothing to show for that day) — the "last 24 bars" fallback
   only applies to the rolling window.
@@ -145,11 +149,8 @@ single cached 5-year daily request per symbol**, which is also the frame
   dates in the future, and `DAY` more than ~730 days back (Yahoo keeps
   hourly bars for 730 days only; daily periods go back decades).
 
-Upstream cost: **one live chart request for exactly the requested window
-(`start`/`end`), not cached** — `cached` is always `false` and `X-Cache`
-is `MISS`. Caching for this path is intentionally deferred until the
-behaviour is settled; the request still counts against the hourly budget,
-so a client that hammers `referenceDate` can reach the `429` limiter.
+Upstream cost: **1 request per call**, for exactly the requested window
+(`start`/`end`, hourly bars for `DAY`, daily bars otherwise).
 
 ---
 
@@ -175,116 +176,57 @@ Default `period=WEEK`.
 |---|---|---|
 | `DAY` | last session @ 5-minute bars | 5-min bar start, ISO-8601 w/ offset |
 | `WEEK` | last 5 trading days @ hourly bars | hourly bar start, ISO-8601 w/ offset |
-| `MONTH`, `HALF_YEAR`, `YEAR`, `FIVE_YEAR` | daily bars from the shared 5-year frame | `YYYY-MM-DD` |
+| `MONTH`, `HALF_YEAR`, `YEAR`, `FIVE_YEAR` | daily bars (smallest covering Yahoo range, sliced) | `YYYY-MM-DD` |
 
-Upstream cost: `DAY` and `WEEK` = 1 request each; the four longer periods
-share the cached 5-year daily request.
-**TTL: 5 minutes for `DAY`, 1 day for every other period.**
+Upstream cost: **1 request per call** (`DAY` may need a second one on a
+weekend).
 
 ---
 
-### Cache administration
-
-* `DELETE /cache` — drop every cached entry from **both** tiers; returns
-  `{"cleared": {"memory": N, "disk": M}, ...stats}`. The next request for
-  anything is a live upstream call again.
-* `GET /cache/stats` — per-tier entry counts and bounds, the TTL, and how
-  much of the hourly upstream budget remains (purges expired entries
-  first).
-
 ### Utility
 
-* `GET /status` — liveness.
+* `GET /status` — liveness, plus how much of the hourly upstream budget
+  is left: `{"status": "online", ..., "upstream_budget": {"per_hour": 1800, "remaining": 1793}}`.
 * `GET /time` — current time in major time zones.
-
-## Caching
-
-```
-request ──► memory (L1) ──miss──► disk (L2) ──miss──► live yfinance call
-               ▲                    ▲                      │
-               └──── write-through on every store ─────────┘
-```
-
-* **Read order:** memory first, then disk. A disk hit is promoted back into
-  memory (keeping its original expiry) so the next read is served from L1.
-* **Write order:** every live result is stored in memory and persisted to
-  disk immediately (write-through).
-* **Two TTLs, chosen per cached frame** and applied identically in both
-  tiers. "As of now" data gets the **short TTL (5 minutes)**; everything
-  else the **long TTL (1 day)**:
-
-  | cached entry | serves | TTL |
-  |---|---|---|
-  | snapshot (`.info`) | `GET /stock/{symbol}` | 5 min |
-  | hourly bars | `historic?period=DAY` | 5 min |
-  | 5-minute session bars | `highlow?period=DAY` | 5 min |
-  | 5-day hourly bars | `highlow?period=WEEK` | 1 day |
-  | 5-year daily bars | historic `WEEK`…`FIVE_YEAR`, highlow `MONTH`…`FIVE_YEAR` | 1 day |
-
-  `historic?referenceDate=` is not cached at all (see that section).
-
-  Expired entries are dropped on read, swept on writes, and removed by
-  `GET /cache/stats` / `DELETE /cache`. Expiry times are persisted, so a
-  restart never revives an entry that had already expired, and a disk hit
-  promoted to memory keeps its original expiry.
-* **Bounded tiers, LRU eviction:** memory by entry count, disk by total
-  bytes. When a tier is full its least-recently-used entries go first.
-* **Disk exists to survive restarts**, which empty the memory tier. After a
-  restart the first request for a still-valid entry is served from disk
-  (`X-Cache: DISK`) with no upstream call.
-
-| variable | default | meaning |
-|---|---|---|
-| `MWL_CACHE_TTL_SECONDS` | `86400` (1 day) | long TTL |
-| `MWL_CACHE_SHORT_TTL_SECONDS` | `300` (5 min) | short TTL |
-| `MWL_MEMORY_CACHE_MAX_ENTRIES` | `512` | memory tier bound (entries) |
-| `MWL_DISK_CACHE_MAX_MB` | `256` | disk tier bound (megabytes) |
-| `MWL_CACHE_DIR` | `.cache` | directory of the SQLite file |
-
-The disk tier is SQLite (WAL mode, pickled values, stdlib-only) and tracks
-LRU recency with a monotonic access counter so eviction order is
-deterministic even for accesses within the same clock tick.
 
 ## Upstream request budget
 
 Yahoo's chart endpoint takes **one symbol per request** and retains intraday
 bars for a limited time only (~60 days for sub-hourly bars, 730 days for
 hourly), so there is no way to batch symbols or to get long windows at
-intraday resolution. What the service does instead:
+intraday resolution. What each API call costs:
 
-| source frame (per symbol) | Yahoo call | serves |
-|---|---|---|
-| hourly | `2d @ 60m` (fallback `5d`) | `/historic DAY` |
-| session | `1d @ 5m` (fallback `5d`) | `/highlow DAY` |
-| week-intraday | `5d @ 60m` | `/highlow WEEK` |
-| **daily5y** | `5y @ 1d` (~1260 rows) | `/historic WEEK MONTH HALF_YEAR YEAR FIVE_YEAR`, `/highlow MONTH HALF_YEAR YEAR FIVE_YEAR` |
-| snapshot | `quoteSummary` + `quote` | `/stock/{symbol}` |
+| API call | Yahoo call(s) |
+|---|---|
+| `/stock/{symbol}` | `quoteSummary` + `quote` (= yfinance `.info`) → **2** |
+| `/historic DAY` | `2d @ 60m` (+ `5d @ 60m` fallback on a long weekend) → **1–2** |
+| `/historic WEEK … FIVE_YEAR` | `1mo / 3mo / 1y / 2y / 5y @ 1d` → **1** |
+| `/historic … &referenceDate=` | `start/end @ 60m` (DAY) or `@ 1d` → **1** |
+| `/highlow DAY` | `1d @ 5m` (+ `5d` fallback) → **1–2** |
+| `/highlow WEEK` | `5d @ 60m` → **1** |
+| `/highlow MONTH … FIVE_YEAR` | `3mo / 1y / 2y / 5y @ 1d` → **1** |
 
-So the whole API surface for one symbol (13 views) costs **6 upstream
-requests**, then nothing until the entries expire. The exception is
-`/historic ... &referenceDate=`, which is currently uncached: one request
-per call, window fetched with explicit `start`/`end`.
+Dotted symbols that need the dash retry pay once more. yfinance itself
+adds a one-off, uncounted timezone-lookup request the first time a process
+sees a symbol via `start`/`end`.
 
-* **Cache**: every source frame goes through the two-tier cache above
-  (5-minute TTL for the three "as of now" frames, 1 day for the rest).
-* **Limiter**: real upstream calls are counted in a sliding 60-minute window
+* **No cache**: request volume on the API maps 1:1 onto Yahoo traffic. This
+  is intentional for now — the earlier two-tier cache (memory + SQLite)
+  was removed to level-set before designing a caching layer around a
+  complete set of use cases. EVALUATION.md records the options considered.
+* **Limiter**: upstream calls are counted in a sliding 60-minute window
   capped at `UPSTREAM_CALL_BUDGET_PER_HOUR = 1800` (10% headroom under 2000
   for other traffic on the same IP). Beyond that the API returns `429`
-  immediately instead of hammering Yahoo and risking an IP block. Cache hits
-  never count; every real HTTP request does, including fallbacks and both
-  halves of `.info`.
-* Worst case per symbol, polled continuously on every view: the three
-  short-TTL frames (4 requests: hourly, session, `.info`×2) refresh up to
-  12×/hour = **48 requests/hour**; the two long-TTL frames add 2/day. So
-  ~37 symbols can be hammered across every view, or ~150 on a single
-  short-TTL view, before the limiter engages.
-* Dotted-symbol dash retries and the 2d→5d window fallbacks each count as
-  separate upstream calls.
+  immediately instead of hammering Yahoo and risking an IP block. Every
+  real HTTP request counts, including fallbacks, dash retries and both
+  halves of `.info`. `GET /status` shows the remaining budget.
+* Practical consequence: 1800 requests/hour is ~30 API calls/minute
+  sustained. A dashboard polling several symbols every few seconds will hit
+  the limiter; that is the signal that the caching layer is needed.
 
-The limiter lives in `rate_limit.py`, caching in `caching.py`. Both are
-designed for one process (threads are fine). For multiple workers or
-instances, replace the memory tier/limiter with Redis so the budget and
-cache are global.
+The limiter lives in `rate_limit.py` and is per-process (threads are
+fine). For multiple workers or instances, back it with Redis so the budget
+is global.
 
 ## Symbols with dots
 
@@ -296,14 +238,19 @@ routes fine. Yahoo's own convention matters more:
 * **US share classes use a dash on Yahoo** — `BRK-B`, `BF-B` — while most
   people type `BRK.B`. When a dotted symbol returns nothing, the request is
   retried once with dots replaced by dashes (a second, budget-charged
-  call). The response echoes the symbol the client asked for; the
-  snapshot's `symbol` field shows Yahoo's canonical (dashed) form.
+  call). This applies to every endpoint - snapshot, historic (with or
+  without `referenceDate`) and highlow all go through the same retry - and
+  fires whether yfinance signals "unknown symbol" with an empty frame (its
+  default) or by raising (`yf.config.debug.hide_exceptions = False`). The
+  `ticker` field echoes the symbol the client asked for; the snapshot's and
+  historic's `symbol` field shows Yahoo's canonical (dashed) form so the
+  translation is visible.
 
 ## Tests
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 169 offline tests, ~15s
+pytest                                            # 110 offline tests, ~7s
 LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 27 opt-in tests against real Yahoo
 ```
 
@@ -317,8 +264,7 @@ and a handful of real requests.
 
 ```
 main.py            FastAPI app (+ /status, /time)
-stock_router.py    the /stock endpoints, source-frame logic, /cache admin
-caching.py         MemoryLRUCache (L1) + DiskLRUCache (L2) + TieredCache, get_or_fetch
+stock_router.py    the /stock endpoints and all yfinance access
 rate_limit.py      SlidingWindowRateLimiter (stdlib only)
 tests/             offline suite + opt-in live tests
 EVALUATION.md      original project evaluation, yfinance option analysis, change history

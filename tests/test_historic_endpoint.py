@@ -10,7 +10,7 @@ from yfinance.exceptions import YFException, YFRateLimitError
 import stock_router
 from tests.conftest import EXCHANGE_TZ, make_ohlc_frame
 
-EXPECTED_KEYS = {"ticker", "period", "interval", "referenceDate", "count", "cached", "data"}
+EXPECTED_KEYS = {"ticker", "symbol", "period", "interval", "referenceDate", "count", "data"}
 
 
 def _strict_json(text: str):
@@ -22,7 +22,24 @@ def _strict_json(text: str):
 
 @pytest.fixture
 def daily_5y():
+    """~5 years of business-day bars ending today. Yahoo returns a range
+    ending now whatever the range is, so the fake answers every daily
+    range with this frame (the API slices it to the look-back itself)."""
     return make_ohlc_frame(periods=1300, freq="B", intraday=False, end=pd.Timestamp.now(tz=EXCHANGE_TZ).normalize())
+
+
+def _daily_for_all_ranges(daily, hourly=None):
+    def respond(period, interval):
+        if interval == "1d":
+            return daily
+        if hourly is not None and interval == "60m":
+            return hourly
+        return pd.DataFrame()
+
+    return respond
+
+
+DAILY_RANGE = {"WEEK": "1mo", "MONTH": "3mo", "HALF_YEAR": "1y", "YEAR": "2y", "FIVE_YEAR": "5y"}
 
 
 def _dates(body):
@@ -41,18 +58,18 @@ def test_default_period_is_day(client, fake_yfinance, hourly_30_bars):
     body = _strict_json(resp.text)
     assert set(body) == EXPECTED_KEYS
     assert body["ticker"] == "AAPL"
+    assert body["symbol"] == "AAPL"
     assert body["period"] == "DAY"
     assert body["interval"] == "1h"
     assert body["count"] == len(body["data"])
-    assert body["cached"] is False
     assert body["referenceDate"] is None  # rolling window, no anchor
-    assert resp.headers["X-Cache"] == "MISS"
+    assert "X-Cache" not in resp.headers  # nothing is cached
     assert all(set(p) == {"datetime", "price"} for p in body["data"])
 
 
 @pytest.mark.parametrize("raw", ["day", "Week", " MONTH "])
 def test_period_is_case_insensitive(client, fake_yfinance, hourly_30_bars, daily_5y, raw):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars, ("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y, hourly_30_bars)
     resp = client.get(f"/stock/AAPL/historic?period={raw}")
     assert resp.status_code == 200
     assert resp.json()["period"] == raw.strip().upper()
@@ -118,7 +135,7 @@ def test_day_skips_nan_close_bars(client, fake_yfinance):
 # WEEK / MONTH: one record per trading day
 # --------------------------------------------------------------------------
 def test_week_is_last_7_days_one_record_per_trading_day(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
 
     body = client.get("/stock/AAPL/historic?period=WEEK").json()
 
@@ -132,7 +149,7 @@ def test_week_is_last_7_days_one_record_per_trading_day(client, fake_yfinance, d
 
 
 def test_month_is_last_30_days_one_record_per_trading_day(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
 
     body = client.get("/stock/AAPL/historic?period=MONTH").json()
 
@@ -149,7 +166,7 @@ def test_month_is_last_30_days_one_record_per_trading_day(client, fake_yfinance,
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("period,days,expected_records", [("HALF_YEAR", 182, 13), ("YEAR", 365, 26)])
 def test_fortnightly_periods(client, fake_yfinance, daily_5y, period, days, expected_records):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
 
     body = client.get(f"/stock/AAPL/historic?period={period}").json()
 
@@ -177,7 +194,7 @@ def test_fortnightly_periods(client, fake_yfinance, daily_5y, period, days, expe
 # FIVE_YEAR: one record per calendar month
 # --------------------------------------------------------------------------
 def test_five_year_is_one_record_per_calendar_month(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
 
     body = client.get("/stock/AAPL/historic?period=FIVE_YEAR").json()
 
@@ -192,47 +209,27 @@ def test_five_year_is_one_record_per_calendar_month(client, fake_yfinance, daily
 
 
 # --------------------------------------------------------------------------
-# Budget: shared daily frame
+# Budget: no cache - every request is one live call, sized to the period
 # --------------------------------------------------------------------------
-def test_all_long_periods_share_one_upstream_call(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+@pytest.mark.parametrize("period,yahoo_range", list(DAILY_RANGE.items()))
+def test_daily_periods_fetch_the_smallest_covering_yahoo_range(client, fake_yfinance, daily_5y, period, yahoo_range):
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
+
+    assert client.get(f"/stock/AAPL/historic?period={period}").status_code == 200
+
+    assert fake_yfinance.calls == [{"symbol": "AAPL", "period": yahoo_range, "interval": "1d"}]
+
+
+def test_every_request_is_a_live_call(client, fake_yfinance, daily_5y, hourly_30_bars):
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y, hourly_30_bars)
     before = stock_router._limiter.remaining()
 
-    headers = {}
-    for p in ("WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
-        r = client.get(f"/stock/AAPL/historic?period={p}")
-        assert r.status_code == 200
-        headers[p] = r.headers["X-Cache"]
+    for _ in range(2):
+        for p in ("DAY", "WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
+            assert client.get(f"/stock/AAPL/historic?period={p}").status_code == 200
 
-    assert fake_yfinance.calls == [{"symbol": "AAPL", "period": "5y", "interval": "1d"}]
-    assert before - stock_router._limiter.remaining() == 1
-    assert headers == {"WEEK": "MISS", "MONTH": "MEMORY", "HALF_YEAR": "MEMORY", "YEAR": "MEMORY", "FIVE_YEAR": "MEMORY"}
-
-
-def test_daily_frame_is_shared_with_highlow_endpoint(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-
-    assert client.get("/stock/AAPL/historic?period=YEAR").status_code == 200
-    resp = client.get("/stock/AAPL/highlow?period=FIVE_YEAR")
-
-    assert resp.status_code == 200
-    assert resp.headers["X-Cache"] == "MEMORY"
-    assert len(fake_yfinance.calls) == 1
-
-
-def test_day_cache_expires_after_ttl(client, fake_yfinance, hourly_30_bars, monkeypatch):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars}
-    clock = {"t": 1_000_000.0}
-    monkeypatch.setattr(stock_router._cache.memory, "_now", lambda: clock["t"])
-    monkeypatch.setattr(stock_router._cache.disk, "_now", lambda: clock["t"])
-
-    client.get("/stock/AAPL/historic")
-    clock["t"] += stock_router._cache.ttl_seconds + 1
-    resp = client.get("/stock/AAPL/historic")
-
-    assert resp.json()["cached"] is False
-    assert resp.headers["X-Cache"] == "MISS"
-    assert len(fake_yfinance.calls) == 2
+    assert len(fake_yfinance.calls) == 12
+    assert before - stock_router._limiter.remaining() == 12
 
 
 # --------------------------------------------------------------------------
@@ -244,13 +241,13 @@ def test_404_when_no_data(client, fake_yfinance):
     assert client.get("/stock/NOPE/historic?period=YEAR").status_code == 404
 
 
-def test_429_when_local_budget_exhausted_but_cached_still_served(client, fake_yfinance, hourly_30_bars, monkeypatch):
+def test_429_when_local_budget_exhausted(client, fake_yfinance, hourly_30_bars, monkeypatch):
     fake_yfinance.responses = {("2d", "60m"): hourly_30_bars}
     monkeypatch.setattr(stock_router._limiter, "max_calls", 1)
 
     assert client.get("/stock/AAPL/historic").status_code == 200
     assert client.get("/stock/MSFT/historic").status_code == 429
-    assert client.get("/stock/AAPL/historic").headers["X-Cache"] == "MEMORY"
+    assert client.get("/stock/AAPL/historic").status_code == 429  # no cache to fall back on
 
 
 def test_yahoo_rate_limit_maps_to_429(client, fake_yfinance):

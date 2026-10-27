@@ -58,7 +58,7 @@ def test_default_period_is_week_and_shape_is_exact(client, fake_yfinance):
     assert set(body) == EXPECTED_KEYS, "body must be exactly the agreed shape"
     assert body["symbol"] == "AAPL"
     assert body["period"] == "WEEK"
-    assert resp.headers["X-Cache"] == "MISS"
+    assert "X-Cache" not in resp.headers  # nothing is cached
     assert fake_yfinance.calls == [{"symbol": "AAPL", "period": "5d", "interval": "60m"}]
 
 
@@ -138,21 +138,21 @@ def test_day_period_falls_back_to_5d_and_keeps_only_last_session(client, fake_yf
 # --------------------------------------------------------------------------
 # MONTH / HALF_YEAR / YEAR / FIVE_YEAR share one daily frame
 # --------------------------------------------------------------------------
-def test_long_periods_share_a_single_upstream_call(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+def _daily_for_all_ranges(daily):
+    """Yahoo returns a range ending now whatever the range is; the API
+    slices the frame to the look-back itself."""
+    return lambda period, interval: daily if interval == "1d" else pd.DataFrame()
+
+
+@pytest.mark.parametrize("period,yahoo_range", [("MONTH", "3mo"), ("HALF_YEAR", "1y"), ("YEAR", "2y"), ("FIVE_YEAR", "5y")])
+def test_daily_periods_are_one_call_for_the_smallest_covering_range(client, fake_yfinance, daily_5y, period, yahoo_range):
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
     before = stock_router._limiter.remaining()
 
-    statuses = {}
-    cache_headers = {}
-    for p in ("MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
-        r = client.get(f"/stock/AAPL/highlow?period={p}")
-        statuses[p] = r.status_code
-        cache_headers[p] = r.headers["X-Cache"]
+    assert client.get(f"/stock/AAPL/highlow?period={period}").status_code == 200
 
-    assert all(s == 200 for s in statuses.values())
-    assert fake_yfinance.calls == [{"symbol": "AAPL", "period": "5y", "interval": "1d"}]
+    assert fake_yfinance.calls == [{"symbol": "AAPL", "period": yahoo_range, "interval": "1d"}]
     assert before - stock_router._limiter.remaining() == 1
-    assert cache_headers == {"MONTH": "MISS", "HALF_YEAR": "MEMORY", "YEAR": "MEMORY", "FIVE_YEAR": "MEMORY"}
 
 
 def test_long_periods_are_sliced_correctly(client, fake_yfinance, daily_5y):
@@ -161,7 +161,7 @@ def test_long_periods_are_sliced_correctly(client, fake_yfinance, daily_5y):
     spike_200d = _spike(daily_5y, _days_ago_position(daily_5y, 200), high=8000.0)  # YEAR, FIVE_YEAR
     spike_100d = _spike(daily_5y, _days_ago_position(daily_5y, 100), high=7000.0)  # HALF_YEAR+
     low_100d = _spike(daily_5y, _days_ago_position(daily_5y, 100), low=0.5)  # HALF_YEAR+
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
 
     month = client.get("/stock/AAPL/highlow?period=MONTH").json()
     half = client.get("/stock/AAPL/highlow?period=HALF_YEAR").json()
@@ -185,7 +185,7 @@ def test_long_periods_are_sliced_correctly(client, fake_yfinance, daily_5y):
 
 
 def test_daily_periods_report_date_only_occurrence(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
+    fake_yfinance.responses = _daily_for_all_ranges(daily_5y)
 
     body = client.get("/stock/AAPL/highlow?period=YEAR").json()
 
@@ -229,31 +229,31 @@ def test_all_nan_frame_is_404_not_500(client, fake_yfinance):
     assert client.get("/stock/AAPL/highlow").status_code == 404
 
 
-def test_cache_hit_reported_in_header_and_saves_budget(client, fake_yfinance):
+def test_repeated_requests_are_repeated_live_calls(client, fake_yfinance):
     fake_yfinance.responses = {("5d", "60m"): make_ohlc_frame(periods=10, freq="h")}
+    before = stock_router._limiter.remaining()
 
     first = client.get("/stock/AAPL/highlow")
-    after_first = stock_router._limiter.remaining()
     second = client.get("/stock/AAPL/highlow")
 
-    assert first.headers["X-Cache"] == "MISS"
-    assert second.headers["X-Cache"] == "MEMORY"
     assert second.json() == first.json()
-    assert stock_router._limiter.remaining() == after_first
+    assert len(fake_yfinance.calls) == 2
+    assert before - stock_router._limiter.remaining() == 2
 
 
-def test_intraday_and_daily_sources_are_cached_independently(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {
+def test_each_period_uses_its_own_source_frame(client, fake_yfinance, daily_5y):
+    fake_yfinance.responses = lambda period, interval: {
         ("5d", "60m"): make_ohlc_frame(periods=10, freq="h"),
-        ("5y", "1d"): daily_5y,
         ("1d", "5m"): make_ohlc_frame(periods=10, freq="5min"),
-    }
+    }.get((period, interval), daily_5y if interval == "1d" else pd.DataFrame())
 
     for p in ("DAY", "WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
         assert client.get(f"/stock/AAPL/highlow?period={p}").status_code == 200
 
-    # All six periods for one ticker cost exactly three upstream calls.
-    assert sorted((c["period"], c["interval"]) for c in fake_yfinance.calls) == [("1d", "5m"), ("5d", "60m"), ("5y", "1d")]
+    # Six periods = six live calls, each sized to its period.
+    assert [(c["period"], c["interval"]) for c in fake_yfinance.calls] == [
+        ("1d", "5m"), ("5d", "60m"), ("3mo", "1d"), ("1y", "1d"), ("2y", "1d"), ("5y", "1d"),
+    ]
 
 
 def test_yahoo_rate_limit_maps_to_429(client, fake_yfinance):
@@ -267,7 +267,7 @@ def test_local_budget_exhausted_maps_to_429(client, fake_yfinance, monkeypatch):
 
     assert client.get("/stock/AAPL/highlow").status_code == 200
     assert client.get("/stock/MSFT/highlow").status_code == 429
-    assert client.get("/stock/AAPL/highlow").headers["X-Cache"] == "MEMORY"  # cached still served
+    assert client.get("/stock/AAPL/highlow").status_code == 429  # no cache to fall back on
 
 
 def test_highlow_route_does_not_shadow_other_ticker_routes(client, fake_yfinance):
