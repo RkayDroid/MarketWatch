@@ -3,6 +3,7 @@ Stock endpoints.
 
     GET /stock/{symbol}                     snapshot: name, sector, price, exchange...
     GET /stock/{symbol}/historic?period=    price series (hourly / daily / fortnightly / monthly)
+                          &referenceDate=    ...the same window ending ON that date instead of now
     GET /stock/{symbol}/highlow?period=     highest & lowest traded price and when
 
 All Yahoo Finance access goes through one cache + one rate limiter (see
@@ -12,7 +13,7 @@ cost table.
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
@@ -101,9 +102,15 @@ _LOOKBACK_DAYS = {
 #   daily5y  5y @ 1d                   -> /historic WEEK..FIVE_YEAR and
 #                                         /highlow MONTH..FIVE_YEAR
 #
+# /historic with referenceDate= is NOT served from these frames: it makes
+# one direct, uncached chart call for exactly the requested window (see
+# _fetch_window). Caching for that path is deliberately left out until the
+# behaviour is settled.
+#
 # Yahoo's chart endpoint accepts ONE symbol per request and retains
-# intraday bars for only ~60 days, so daily bars are the only option for
-# the longer windows anyway. Fetching the longest daily window once and
+# intraday bars for a limited time only (~60 days for sub-hourly, 730 days
+# for hourly), so daily bars are the only option for the longer windows
+# anyway. Fetching the longest daily window once and
 # slicing/downsampling it locally means nine different period views of a
 # ticker share a single upstream request.
 # --------------------------------------------------------------------------
@@ -112,6 +119,11 @@ PRIMARY_HOURLY_PERIOD = "2d"
 FALLBACK_PERIOD = "5d"
 SESSION_INTERVAL = "5m"
 DAILY_RANGE = ("5y", "1d")
+
+# Yahoo keeps hourly bars for ~730 days only (yfinance encodes the same
+# limit), so a DAY window ending earlier than that can never be served and
+# is rejected (422) before any upstream call.
+HOURLY_RETENTION_DAYS = 730
 
 
 def _run_upstream(key: str, fetch_fn: Callable[[], object], ttl_seconds: float):
@@ -122,8 +134,20 @@ def _run_upstream(key: str, fetch_fn: Callable[[], object], ttl_seconds: float):
 
     Returns (value, cache_status) with cache_status in MEMORY | DISK | MISS.
     """
+    return _translate_upstream_errors(lambda: get_or_fetch(_cache, key, fetch_fn, ttl_seconds=ttl_seconds))
+
+
+def _run_upstream_uncached(fetch_fn: Callable[[], object]):
+    """Execute `fetch_fn` live, bypassing the cache entirely (nothing is
+    read from or written to either tier), with the same error mapping as
+    `_run_upstream`. The rate limiter still applies. Returns
+    (value, "MISS")."""
+    return _translate_upstream_errors(fetch_fn), "MISS"
+
+
+def _translate_upstream_errors(call: Callable[[], object]):
     try:
-        return get_or_fetch(_cache, key, fetch_fn, ttl_seconds=ttl_seconds)
+        return call()
     except RateLimitExceeded as exc:
         raise HTTPException(
             status_code=429,
@@ -146,7 +170,8 @@ def _run_upstream(key: str, fetch_fn: Callable[[], object], ttl_seconds: float):
 
 
 def _fetch_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """Single yfinance chart call, charged to the rate limiter.
+    """Single yfinance chart call for a Yahoo range (e.g. "5y"), charged to
+    the rate limiter.
 
     Dotted symbols: Yahoo uses dots for exchange suffixes (SAP.DE, 0700.HK,
     BARC.L) - those work as-is - but expects a DASH for US share classes
@@ -154,11 +179,24 @@ def _fetch_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
     returns nothing, retry once with dots replaced by dashes; the retry is
     a second, separately charged upstream call.
     """
+    return _fetch_chart(ticker, period=period, interval=interval)
+
+
+def _fetch_window(ticker: str, first_day: date, day_after_last: date, interval: str) -> pd.DataFrame:
+    """Single yfinance chart call for an explicit date window, charged to
+    the rate limiter. yfinance treats naive dates as midnight in the
+    exchange's time zone, `start` inclusive and `end` exclusive, so the
+    call returns exactly the calendar days [first_day, day_after_last).
+    Same dotted-symbol retry as `_fetch_history`."""
+    return _fetch_chart(ticker, start=first_day, end=day_after_last, interval=interval)
+
+
+def _fetch_chart(ticker: str, **history_kwargs) -> pd.DataFrame:
     _limiter.try_acquire()
-    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+    df = yf.Ticker(ticker).history(auto_adjust=True, **history_kwargs)
     if df.empty and "." in ticker:
         _limiter.try_acquire()
-        df = yf.Ticker(ticker.replace(".", "-")).history(period=period, interval=interval, auto_adjust=True)
+        df = yf.Ticker(ticker.replace(".", "-")).history(auto_adjust=True, **history_kwargs)
     return df
 
 
@@ -215,6 +253,31 @@ def _slice_lookback(df: pd.DataFrame, days: int) -> pd.DataFrame:
         return df
     cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=days)
     return df[df.index >= cutoff]
+
+
+def _localize_date(d: date, tz) -> pd.Timestamp:
+    """Midnight of calendar day `d` in the frame's (exchange) time zone."""
+    return pd.Timestamp(d).tz_localize(tz or "UTC")
+
+
+def _window_bounds(reference_date: date, days: int) -> Tuple[date, date]:
+    """(first_day, day_after_last) of the `days`-long window that ENDS on
+    `reference_date` inclusive: start inclusive, end exclusive - the
+    convention yfinance uses for start/end."""
+    return reference_date - timedelta(days=days - 1), reference_date + timedelta(days=1)
+
+
+def _slice_window(df: pd.DataFrame, reference_date: date, days: int) -> pd.DataFrame:
+    """Keep only the bars of the `days`-long window ending on
+    `reference_date` (inclusive), measured in calendar days of the
+    exchange's time zone. yfinance already fetches exactly this window; the
+    local slice just guarantees the contract regardless of upstream quirks
+    and makes DAY one local trading date, not 24 absolute hours."""
+    if df.empty:
+        return df
+    first_day, day_after = _window_bounds(reference_date, days)
+    tz = df.index.tz
+    return df[(df.index >= _localize_date(first_day, tz)) & (df.index < _localize_date(day_after, tz))]
 
 
 # --------------------------------------------------------------------------
@@ -364,8 +427,13 @@ _HISTORIC_SPEC = {
 }
 
 
+def _window_days(period: Period) -> int:
+    return 1 if period == Period.DAY else _HISTORIC_SPEC[period][1]
+
+
 def _historic_points(ticker: str, period: Period) -> Tuple[List[dict], str, str]:
-    """Return (points, interval_label, cache_status) for the period."""
+    """Return (points, interval_label, cache_status) for the rolling window
+    ending now."""
     if period == Period.DAY:
         df, cache_status = _get_hourly_frame(ticker)
         return _to_points(_last_24h(df), intraday=True), "1h", cache_status
@@ -378,11 +446,70 @@ def _historic_points(ticker: str, period: Period) -> Tuple[List[dict], str, str]
     return _to_points(df, intraday=False), interval_label, cache_status
 
 
+def _historic_points_ending_on(ticker: str, period: Period, reference_date: date) -> Tuple[List[dict], str, str]:
+    """Return (points, interval_label, cache_status) for the window of
+    `period`'s length that ENDS on `reference_date` (inclusive).
+
+    One direct, uncached chart call for exactly that window: hourly bars
+    for DAY, daily bars otherwise, then the same downsampling as the
+    rolling window. cache_status is always "MISS".
+    """
+    days = _window_days(period)
+    first_day, day_after = _window_bounds(reference_date, days)
+    if period == Period.DAY:
+        df, cache_status = _run_upstream_uncached(lambda: _fetch_window(ticker, first_day, day_after, HOURLY_INTERVAL))
+        return _to_points(_slice_window(df, reference_date, days), intraday=True), "1h", cache_status
+
+    interval_label, _, downsample = _HISTORIC_SPEC[period]
+    df, cache_status = _run_upstream_uncached(lambda: _fetch_window(ticker, first_day, day_after, "1d"))
+    df = _slice_window(df, reference_date, days)
+    if downsample is not None and not df.empty:
+        df = downsample(df)
+    return _to_points(df, intraday=False), interval_label, cache_status
+
+
+def _today_utc() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _validate_reference_date(reference_date: date, period: Period) -> None:
+    """Reject windows that can never have data BEFORE spending upstream
+    budget: future dates, and DAY windows older than Yahoo's hourly
+    retention."""
+    today = _today_utc()
+    # Exchanges east of UTC are already on "tomorrow" for part of every UTC
+    # day, so their current local date must still be accepted: allow one
+    # day of slack (no exchange is more than 14h ahead of UTC).
+    if reference_date > today + timedelta(days=1):
+        raise HTTPException(
+            status_code=422,
+            detail=f"referenceDate {reference_date.isoformat()} is in the future (today is {today.isoformat()} UTC).",
+        )
+    if period == Period.DAY and reference_date < today - timedelta(days=HOURLY_RETENTION_DAYS):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"referenceDate {reference_date.isoformat()} is too old for period DAY: Yahoo Finance keeps hourly "
+                f"bars for ~{HOURLY_RETENTION_DAYS} days only. Use a more recent referenceDate or a daily period "
+                "(WEEK, MONTH...)."
+            ),
+        )
+
+
 @router.get("/{ticker}/historic")
 def get_historic_prices(
     ticker: str,
     response: Response,
     period: Period = Query(Period.DAY, description="Look-back window. Case-insensitive. Default DAY."),
+    reference_date: Optional[date] = Query(
+        None,
+        alias="referenceDate",
+        description=(
+            "Optional end date of the window, YYYY-MM-DD (e.g. 2026-10-23), inclusive. When given, the window "
+            "is the length of `period` ENDING on this date (exchange-local calendar days) instead of ending now. "
+            "Must not be in the future; for DAY it must be within Yahoo's ~730-day hourly retention."
+        ),
+    ),
 ):
     """Price series for `ticker` over the chosen period.
 
@@ -395,36 +522,61 @@ def get_historic_prices(
     | YEAR      | last 12 months| fortnight (14-day bin)    | YYYY-MM-DD                 |
     | FIVE_YEAR | last 5 years  | calendar month            | YYYY-MM-DD                 |
 
+    With `referenceDate=YYYY-MM-DD` the same window length ENDS on that
+    date (inclusive) instead of now: DAY -> that trading date's hourly
+    bars, WEEK -> the 7 calendar days up to and including it, and so on.
+    Window bounds are calendar days in the exchange's time zone.
+
     Response::
 
         {
           "ticker": "AAPL",
-          "period": "DAY",
-          "interval": "1h",
-          "count": 7,
+          "period": "WEEK",
+          "interval": "1d",
+          "referenceDate": "2024-05-07",
+          "count": 5,
           "cached": false,
-          "data": [ {"datetime": "2024-05-01T09:30:00-04:00", "price": 172.34}, ... ]
+          "data": [ {"datetime": "2024-05-01", "price": 172.34}, ... ]
         }
+
+    `referenceDate` is null for the default rolling window.
 
     * `price` is the bar's Close. For fortnight/month records it is the
       close of the last trading day in that bin, and `datetime` is that
       day; bins are anchored at the newest bar so the final record is
-      always the latest close.
-    * DAY: if the market has been closed for more than 24h (long weekend)
-      the most recent 24 hourly bars are returned instead of an empty list.
-    * Upstream cost: DAY = one hourly call cached for the SHORT TTL
-      (5 min); WEEK..FIVE_YEAR all share one 5-year daily call per ticker
-      cached for the LONG TTL (1 day), also shared with /highlow.
+      always the latest close (of the window).
+    * DAY without referenceDate: if the market has been closed for more
+      than 24h (long weekend) the most recent 24 hourly bars are returned
+      instead of an empty list. With referenceDate, a date the market was
+      closed is simply 404 (there is nothing to show for that day).
+    * Upstream cost without referenceDate: DAY = one hourly call cached
+      for the SHORT TTL (5 min); WEEK..FIVE_YEAR all share one 5-year
+      daily call per ticker cached for the LONG TTL (1 day), also shared
+      with /highlow.
+    * Upstream cost with referenceDate: exactly one live chart call for
+      the requested window, NOT cached (always `cached: false`,
+      `X-Cache: MISS`); caching for this path is intentionally deferred.
+      The call still counts against the hourly budget. Impossible windows
+      (future, DAY beyond retention, malformed date) are rejected with 422
+      before any upstream call.
     """
     ticker = ticker.upper()
-    points, interval_label, cache_status = _historic_points(ticker, period)
+    if reference_date is None:
+        points, interval_label, cache_status = _historic_points(ticker, period)
+    else:
+        _validate_reference_date(reference_date, period)
+        points, interval_label, cache_status = _historic_points_ending_on(ticker, period, reference_date)
     if not points:
-        raise HTTPException(status_code=404, detail=f"No price data found for {ticker} over period {period.value}.")
+        window = f" ending {reference_date.isoformat()}" if reference_date is not None else ""
+        raise HTTPException(
+            status_code=404, detail=f"No price data found for {ticker} over period {period.value}{window}."
+        )
     response.headers["X-Cache"] = cache_status
     return {
         "ticker": ticker,
         "period": period.value,
         "interval": interval_label,
+        "referenceDate": reference_date.isoformat() if reference_date is not None else None,
         "count": len(points),
         "cached": cache_status != "MISS",
         "data": points,

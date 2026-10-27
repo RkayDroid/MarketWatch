@@ -100,6 +100,7 @@ three buckets; this section records the design decisions and what changed.
 |---|---|
 | `GET /stock/{symbol}` | **reshaped** to a fixed 10-field snapshot (`ticker, sector, fulldayPrice, currency, symbol, language, longName, exchange, market, displayName`) instead of dumping the whole `.info` dict |
 | `GET /stock/{symbol}/historic?period=` | **replaces** `/hourly` (now `period=DAY`) and the raw `/history` pass-through; adds WEEK/MONTH (daily), HALF_YEAR/YEAR (fortnightly), FIVE_YEAR (monthly) |
+| `GET /stock/{symbol}/historic?period=&referenceDate=` | **added later**: optional `referenceDate=YYYY-MM-DD` makes the `period`-long window end on that date, inclusive (see "referenceDate" below) |
 | `GET /stock/{symbol}/highlow?period=` | unchanged contract |
 | `GET /stock/hourly/batch` | **removed** (was a bonus; not in the agreed surface — and it never saved Yahoo quota, see §2) |
 | `mainxx.py` | deleted (PyCharm scaffold, dead code) |
@@ -185,12 +186,59 @@ found the two horizons ambiguous, so it was simplified to:
   dash form once when a dotted symbol comes back empty; the retry is
   charged to the budget and the two spellings cache separately.
 
+### `referenceDate` on `/historic` (added later)
+
+Requirement: `historic?period=X&referenceDate=2026-10-23` returns the
+window of `X`'s length that **ends on that date, inclusive**.
+
+**Semantics.** `[referenceDate − (N−1) days, referenceDate]` in calendar
+days of the exchange's time zone, where N is the period's length in days
+(DAY 1, WEEK 7, MONTH 30, HALF_YEAR 182, YEAR 365, FIVE_YEAR 5y). So a
+`DAY` window is one local trading date (not 24 absolute hours — DST days
+and non-US exchanges behave sensibly). Granularity/downsampling is
+identical to the rolling window; bins are anchored at the newest bar of
+the window so the last record is the last close on or before
+`referenceDate`. The response gains one nullable field, `referenceDate`;
+nothing existing moved.
+
+**Implementation — deliberately simple, no caching.** The first cut of
+this feature reused cached source frames and added two "archive" frames
+to keep Yahoo traffic flat. That was judged confusing before the window
+semantics were even settled, so it was replaced by the most direct thing
+that can be correct: one `yf.Ticker(symbol).history(start=first_day,
+end=referenceDate + 1 day, interval=60m|1d)` call per request, bypassing
+the cache entirely (`_run_upstream_uncached`: nothing read, nothing
+stored; `cached: false`, `X-Cache: MISS`). yfinance interprets naive
+dates as exchange-local midnight, `start` inclusive / `end` exclusive
+(`yfinance/utils.py:_parse_user_dt`), which is exactly the window; the
+result is still sliced locally to the same bounds as a guarantee against
+upstream quirks. The rate limiter, the error mapping (404/429/502) and
+the `BRK.B`→`BRK-B` retry apply unchanged because the call goes through
+the same `_fetch_chart` choke point as every other chart request. The
+rolling-window path and its cache are untouched.
+
+**Rejected before any upstream call (422):** malformed dates (FastAPI
+`date` parsing), dates more than one day in the future (the one-day slack
+is for exchanges east of UTC, which are already on "tomorrow" for part of
+every UTC day), and `DAY` more than 730 days back (Yahoo has no hourly
+bars that old; the message points at the daily periods). `DAY` on a
+non-trading date is an honest 404 — the rolling window's "last 24 bars"
+fallback is deliberately not applied to an explicit date.
+
+**Cost and what to do about it later.** Every `referenceDate` request is
+one Yahoo request, so a client scrubbing through dates spends budget
+linearly. When the semantics are confirmed, the obvious next step is to
+cache by window (key `src:{symbol}:{interval}:{first_day}:{day_after}`,
+long TTL for windows that end before today, short TTL otherwise), and/or
+serve windows inside the already-cached 5-year daily frame from it. Both
+fit the existing `_run_upstream` pattern without touching the endpoint.
+
 ## 5. Testing
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 129 offline tests, ~5s
-LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 23 opt-in tests against real Yahoo
+pytest                                            # 169 offline tests, ~15s
+LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 27 opt-in tests against real Yahoo
 ```
 
 **Caveat:** the sandbox this was built in has no outbound internet (DNS to
@@ -234,6 +282,22 @@ calendar month equal to the month-end close; all five long periods = one
 upstream call; frame shared with `/highlow`; TTL expiry; 404/429/502
 mapping.
 
+`test_historic_reference_date.py` — `referenceDate`: echo, always
+`cached: false` / `X-Cache: MISS`; **the yfinance call is made with
+`start = referenceDate − (N−1)` and `end = referenceDate + 1` for every
+period** (the one test that pins the inclusive-end contract at the
+upstream boundary); WEEK/MONTH exact records vs the source frame, the
+reference date itself included and the day before the window excluded;
+HALF_YEAR/YEAR fortnights and FIVE_YEAR months confined to the window with
+the window's last close as the last record; `referenceDate=today` equals
+the rolling window; **DAY**: exactly that exchange-local date's bars, DST
+day has 23/25 bars, closed day = 404 (no 24-bar fallback), NaN closes
+skipped; bars outside the window returned by upstream are dropped; **no
+caching**: three identical requests = three live calls and nothing stored,
+the rolling window's cache is neither used nor disturbed; **422 without
+upstream call** for future/too-old/malformed dates, `tomorrow` accepted
+for exchanges ahead of UTC; 404/429/502 mapping; `BRK.B` → `BRK-B` retry.
+
 `test_highlow_endpoint.py` — exact 6-key shape; High/Low selection with bar
 timestamps; DAY session fallback; planted extremes 100/200/400 days back
 resolve differently per window; long periods = one call; NaN handling;
@@ -268,7 +332,11 @@ by both tiers, 429 when budget is exhausted and the entry has expired),
 
 `test_live_yfinance.py` — opt-in: snapshot for AAPL/VTI/unknown, historic
 for all six periods, "five long periods + highlow = one upstream call"
-guarantee against real Yahoo, highlow for all six periods.
+guarantee against real Yahoo, highlow for all six periods; `referenceDate`:
+a WEEK ending on a past weekday (last record == referenceDate, one live
+call, nothing cached), past-date DAY sessions (6–8 hourly bars, all on
+that date), 422 beyond hourly retention with no call, a MONTH ending
+2015-03-31.
 
 ## 6. Other clean-ups made
 

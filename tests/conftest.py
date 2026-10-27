@@ -74,12 +74,30 @@ def make_ohlc_frame(
     return df
 
 
+def _empty_frame() -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    empty.index.name = "Date"
+    return empty
+
+
+def slice_like_yahoo(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    """What yfinance returns for history(start=, end=): bars in
+    [start, end) with naive dates taken as exchange-local midnight."""
+    tz = df.index.tz
+    lo = pd.Timestamp(start).tz_localize(tz)
+    hi = pd.Timestamp(end).tz_localize(tz)
+    return df[(df.index >= lo) & (df.index < hi)]
+
+
 class FakeTicker:
     """Stand-in for yfinance.Ticker.
 
     Configure via class attributes on a per-test basis:
       * ``responses``: dict mapping (period, interval) -> DataFrame, or a
         callable(period, interval) -> DataFrame. Missing keys -> empty df.
+      * ``window_responses``: callable(start, end, interval) -> DataFrame
+        for ``history(start=, end=)`` calls (the referenceDate path).
+        None -> empty df.
       * ``info_payload``: dict returned by ``.info``.
       * ``info_for``: per-symbol override, dict symbol -> info dict
         (symbols absent from it get an empty dict, i.e. "unknown").
@@ -88,6 +106,7 @@ class FakeTicker:
     """
 
     responses = {}
+    window_responses = None
     info_payload = {}
     info_for = None  # dict symbol -> info dict; None = use info_payload for all
     raise_on_history = None
@@ -96,7 +115,16 @@ class FakeTicker:
     def __init__(self, symbol, session=None):
         self.symbol = symbol
 
-    def history(self, period="1mo", interval="1d", **kwargs):
+    def history(self, period=None, interval="1d", start=None, end=None, **kwargs):
+        if start is not None or end is not None:
+            # Like yfinance: start/end replace the Yahoo range.
+            FakeTicker.calls.append({"symbol": self.symbol, "start": start, "end": end, "interval": interval})
+            if FakeTicker.raise_on_history is not None:
+                raise FakeTicker.raise_on_history
+            if FakeTicker.window_responses is None:
+                return _empty_frame()
+            return FakeTicker.window_responses(start, end, interval)
+        period = period or "1mo"
         FakeTicker.calls.append({"symbol": self.symbol, "period": period, "interval": interval})
         if FakeTicker.raise_on_history is not None:
             raise FakeTicker.raise_on_history
@@ -105,9 +133,7 @@ class FakeTicker:
             return responses(period, interval)
         df = responses.get((period, interval))
         if df is None:
-            empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-            empty.index.name = "Date"
-            return empty
+            return _empty_frame()
         return df
 
     @property
@@ -146,6 +172,7 @@ def fake_yfinance(monkeypatch, request, tmp_path):
     monkeypatch.setattr(stock_router, "_cache", cache)
 
     FakeTicker.responses = {}
+    FakeTicker.window_responses = None
     FakeTicker.info_payload = {}
     FakeTicker.info_for = None
     FakeTicker.raise_on_history = None

@@ -61,9 +61,11 @@ Upstream cost: **2 requests** (`.info` is `quoteSummary` + `quote`). **TTL: 5 mi
 
 ---
 
-### 2. `GET /stock/{symbol}/historic?period=DAY` — price series
+### 2. `GET /stock/{symbol}/historic?period=DAY[&referenceDate=YYYY-MM-DD]` — price series
 
-Default `period=DAY`.
+Default `period=DAY`. Without `referenceDate` the window is the last
+`period` ending now; with `referenceDate` the same window length **ends on
+that date (inclusive)** — see below.
 
 | period | window | one record per | `datetime` format |
 |---|---|---|---|
@@ -79,6 +81,7 @@ Default `period=DAY`.
   "ticker": "AAPL",
   "period": "DAY",
   "interval": "1h",
+  "referenceDate": null,
   "count": 7,
   "cached": false,
   "data": [
@@ -102,6 +105,51 @@ Upstream cost: `DAY` = 1 request (hourly bars); **`WEEK`…`FIVE_YEAR` share a
 single cached 5-year daily request per symbol**, which is also the frame
 `/highlow` uses for its longer periods.
 **TTL: 5 minutes for `DAY`, 1 day for every other period.**
+
+#### `referenceDate` — end the window on a given date
+
+`GET /stock/AAPL/historic?period=WEEK&referenceDate=2026-10-23`
+
+```json
+{
+  "ticker": "AAPL",
+  "period": "WEEK",
+  "interval": "1d",
+  "referenceDate": "2026-10-23",
+  "count": 5,
+  "cached": false,
+  "data": [
+    { "datetime": "2026-10-19", "price": 172.34 },
+    { "datetime": "2026-10-20", "price": 173.10 },
+    { "datetime": "2026-10-21", "price": 171.80 },
+    { "datetime": "2026-10-22", "price": 174.02 },
+    { "datetime": "2026-10-23", "price": 175.55 }
+  ]
+}
+```
+
+* Format `YYYY-MM-DD`. The window is the `period`'s length **ending on
+  `referenceDate`, inclusive**, in calendar days of the exchange's time
+  zone: `DAY` → the hourly bars of that trading date, `WEEK` → the 7 days
+  up to and including it (`2026-10-17`…`2026-10-23` above), `MONTH` → 30
+  days, `HALF_YEAR` → 182, `YEAR` → 365, `FIVE_YEAR` → 5 years. Record
+  granularity and downsampling are exactly as in the table above; bins are
+  anchored at the newest bar of the window, so the last record is the last
+  close on or before `referenceDate`.
+* `referenceDate` is echoed in the response and is `null` for the default
+  rolling window.
+* `DAY` with a `referenceDate` on which the market was closed is a `404`
+  (there is nothing to show for that day) — the "last 24 bars" fallback
+  only applies to the rolling window.
+* Rejected with `422`, **without any upstream call**: malformed dates,
+  dates in the future, and `DAY` more than ~730 days back (Yahoo keeps
+  hourly bars for 730 days only; daily periods go back decades).
+
+Upstream cost: **one live chart request for exactly the requested window
+(`start`/`end`), not cached** — `cached` is always `false` and `X-Cache`
+is `MISS`. Caching for this path is intentionally deferred until the
+behaviour is settled; the request still counts against the hourly budget,
+so a client that hammers `referenceDate` can reach the `429` limiter.
 
 ---
 
@@ -173,6 +221,8 @@ request ──► memory (L1) ──miss──► disk (L2) ──miss──► 
   | 5-day hourly bars | `highlow?period=WEEK` | 1 day |
   | 5-year daily bars | historic `WEEK`…`FIVE_YEAR`, highlow `MONTH`…`FIVE_YEAR` | 1 day |
 
+  `historic?referenceDate=` is not cached at all (see that section).
+
   Expired entries are dropped on read, swept on writes, and removed by
   `GET /cache/stats` / `DELETE /cache`. Expiry times are persisted, so a
   restart never revives an entry that had already expired, and a disk hit
@@ -198,8 +248,9 @@ deterministic even for accesses within the same clock tick.
 ## Upstream request budget
 
 Yahoo's chart endpoint takes **one symbol per request** and retains intraday
-bars for only ~60 days, so there is no way to batch symbols or to get long
-windows at intraday resolution. What the service does instead:
+bars for a limited time only (~60 days for sub-hourly bars, 730 days for
+hourly), so there is no way to batch symbols or to get long windows at
+intraday resolution. What the service does instead:
 
 | source frame (per symbol) | Yahoo call | serves |
 |---|---|---|
@@ -210,7 +261,9 @@ windows at intraday resolution. What the service does instead:
 | snapshot | `quoteSummary` + `quote` | `/stock/{symbol}` |
 
 So the whole API surface for one symbol (13 views) costs **6 upstream
-requests**, then nothing until the entries expire.
+requests**, then nothing until the entries expire. The exception is
+`/historic ... &referenceDate=`, which is currently uncached: one request
+per call, window fetched with explicit `start`/`end`.
 
 * **Cache**: every source frame goes through the two-tier cache above
   (5-minute TTL for the three "as of now" frames, 1 day for the rest).
@@ -250,8 +303,8 @@ routes fine. Yahoo's own convention matters more:
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 129 offline tests, ~5s
-LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 23 opt-in tests against real Yahoo
+pytest                                            # 169 offline tests, ~15s
+LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 27 opt-in tests against real Yahoo
 ```
 
 The offline suite patches `yfinance.Ticker` with a fake whose frames match
