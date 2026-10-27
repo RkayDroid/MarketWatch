@@ -3,7 +3,8 @@ Stock endpoints.
 
     GET /stock/{symbol}                         snapshot: name, sector, price, exchange...
     GET /stock/{symbol}/historic?period=        price series (hourly / daily / fortnightly / monthly)
-                              &referenceDate=   ...the same window ending ON that date instead of now
+                              &referenceDate=   ...the same window ending ON that date (or on each of
+                                                up to 5 comma-separated dates) instead of now
     GET /stock/{symbol}/highlow?period=         highest & lowest traded price and when
 
 There is NO caching in this version: every request is exactly one live
@@ -14,6 +15,7 @@ protection is the sliding-window rate limiter in `rate_limit.py`, which
 hard-caps upstream calls per hour and answers 429 beyond that.
 """
 
+import re
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
@@ -92,6 +94,11 @@ DAILY_INTERVAL = "1d"
 # limit), so a DAY window ending earlier than that can never be served and
 # is rejected (422) before any upstream call.
 HOURLY_RETENTION_DAYS = 730
+
+# `referenceDate` accepts a comma-separated list; each date is one upstream
+# call, so the list is capped.
+MAX_REFERENCE_DATES = 5
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Marks a frame with the symbol Yahoo actually answered for (e.g. "BRK-B"
 # when the client asked for "BRK.B"). pandas `attrs` survive slicing.
@@ -449,6 +456,36 @@ def _today_utc() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def _parse_reference_dates(raw: str) -> List[date]:
+    """Parse the `referenceDate` query value: 1..MAX_REFERENCE_DATES
+    comma-separated YYYY-MM-DD dates, whitespace tolerated, no duplicates.
+    Every problem is a 422 naming the offending item, raised before any
+    upstream call is made."""
+    items = [item.strip() for item in raw.split(",")]
+    if len(items) > MAX_REFERENCE_DATES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"referenceDate accepts at most {MAX_REFERENCE_DATES} dates, got {len(items)}.",
+        )
+    dates: List[date] = []
+    for item in items:
+        if not item:
+            raise HTTPException(
+                status_code=422,
+                detail="referenceDate contains an empty item; expected comma-separated YYYY-MM-DD dates.",
+            )
+        if not _ISO_DATE.match(item):
+            raise HTTPException(status_code=422, detail=f"referenceDate '{item}' is not a valid YYYY-MM-DD date.")
+        try:
+            parsed = date.fromisoformat(item)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"referenceDate '{item}' is not a valid calendar date.")
+        if parsed in dates:
+            raise HTTPException(status_code=422, detail=f"referenceDate contains '{item}' more than once.")
+        dates.append(parsed)
+    return dates
+
+
 def _validate_reference_date(reference_date: date, period: Period) -> None:
     """Reject windows that can never have data BEFORE spending upstream
     budget: future dates, and DAY windows older than Yahoo's hourly
@@ -477,13 +514,15 @@ def _validate_reference_date(reference_date: date, period: Period) -> None:
 def get_historic_prices(
     ticker: str,
     period: Period = Query(Period.DAY, description="Look-back window. Case-insensitive. Default DAY."),
-    reference_date: Optional[date] = Query(
+    reference_date: Optional[str] = Query(
         None,
         alias="referenceDate",
         description=(
-            "Optional end date of the window, YYYY-MM-DD (e.g. 2026-10-23), inclusive. When given, the window "
-            "is the length of `period` ENDING on this date (exchange-local calendar days) instead of ending now. "
-            "Must not be in the future; for DAY it must be within Yahoo's ~730-day hourly retention."
+            "Optional end date(s) of the window, YYYY-MM-DD, inclusive: one date (2026-10-23) or up to "
+            f"{MAX_REFERENCE_DATES} unique dates separated by commas (2026-10-23,2026-10-16). The window is the "
+            "length of `period` ENDING on each date (exchange-local calendar days) instead of ending now, and the "
+            "response is keyed by date. Dates must not be in the future; for DAY they must be within Yahoo's "
+            "~730-day hourly retention."
         ),
     ),
 ):
@@ -498,28 +537,42 @@ def get_historic_prices(
     | YEAR      | last 12 months| fortnight (14-day bin)    | YYYY-MM-DD                 |
     | FIVE_YEAR | last 5 years  | calendar month            | YYYY-MM-DD                 |
 
-    With `referenceDate=YYYY-MM-DD` the same window length ENDS on that
-    date (inclusive) instead of now: DAY -> that trading date's hourly
-    bars, WEEK -> the 7 calendar days up to and including it, and so on.
-    Window bounds are calendar days in the exchange's time zone.
+    Response (rolling window)::
 
-    Response::
+        {
+          "ticker": "AAPL",
+          "symbol": "AAPL",
+          "period": "DAY",
+          "interval": "1h",
+          "count": 7,
+          "data": [ {"datetime": "2024-05-01T09:30:00-04:00", "price": 172.34}, ... ]
+        }
+
+    With `referenceDate=YYYY-MM-DD[,YYYY-MM-DD...]` (up to 5 unique dates)
+    the same window length ENDS on each date (inclusive) instead of now:
+    DAY -> that trading date's hourly bars, WEEK -> the 7 calendar days up
+    to and including it, and so on. Window bounds are calendar days in
+    the exchange's time zone. The response is then keyed by date, in the
+    order given::
 
         {
           "ticker": "BRK.B",
           "symbol": "BRK-B",
           "period": "WEEK",
           "interval": "1d",
-          "referenceDate": "2024-05-07",
-          "count": 5,
-          "data": [ {"datetime": "2024-05-01", "price": 172.34}, ... ]
+          "results": {
+            "2024-05-07": {"count": 5, "data": [ {"datetime": "2024-05-01", "price": 172.34}, ... ]},
+            "2024-04-30": {"count": 5, "data": [ ... ]}
+          }
         }
 
-    `referenceDate` is null for the default rolling window. `ticker` echoes
-    the request; `symbol` is the symbol Yahoo actually answered for - they
-    differ only for US share classes typed with a dot (BRK.B -> BRK-B),
-    which are retried in Yahoo's dash form when the dotted form is unknown
-    (same rule as the snapshot endpoint).
+    A date with no bars (market closed) is reported as `count: 0,
+    data: []`; the request is 404 only if every date is empty.
+
+    `ticker` echoes the request; `symbol` is the symbol Yahoo actually
+    answered for - they differ only for US share classes typed with a dot
+    (BRK.B -> BRK-B), which are retried in Yahoo's dash form when the
+    dotted form is unknown (same rule as the snapshot endpoint).
 
     * `price` is the bar's Close. For fortnight/month records it is the
       close of the last trading day in that bin, and `datetime` is that
@@ -529,30 +582,52 @@ def get_historic_prices(
       than 24h (long weekend) the most recent 24 hourly bars are returned
       instead of an empty list. With referenceDate, a date the market was
       closed is simply 404 (there is nothing to show for that day).
-    * Upstream cost: one live chart call per request (DAY may need a
-      second one on a long weekend; dotted symbols may be retried once).
-      Nothing is cached. Impossible windows (future, DAY beyond retention,
-      malformed date) are rejected with 422 before any upstream call.
+    * Upstream cost: one live chart call per request, or one per reference
+      date (DAY may need a second one on a long weekend; dotted symbols may
+      be retried once). Nothing is cached. Invalid input (malformed or
+      duplicate dates, more than 5, future dates, DAY beyond retention) is
+      rejected with 422 before any upstream call.
     """
     ticker = ticker.upper()
     if reference_date is None:
         points, interval_label, yahoo_symbol = _historic_points(ticker, period)
-    else:
-        _validate_reference_date(reference_date, period)
-        points, interval_label, yahoo_symbol = _historic_points_ending_on(ticker, period, reference_date)
-    if not points:
-        window = f" ending {reference_date.isoformat()}" if reference_date is not None else ""
+        if not points:
+            raise HTTPException(
+                status_code=404, detail=f"No price data found for {ticker} over period {period.value}."
+            )
+        return {
+            "ticker": ticker,
+            "symbol": yahoo_symbol,
+            "period": period.value,
+            "interval": interval_label,
+            "count": len(points),
+            "data": points,
+        }
+
+    dates = _parse_reference_dates(reference_date)
+    for d in dates:
+        _validate_reference_date(d, period)
+
+    results = {}
+    yahoo_symbol = ticker
+    interval_label = ""
+    for d in dates:
+        points, interval_label, symbol_used = _historic_points_ending_on(ticker, period, d)
+        if points:
+            yahoo_symbol = symbol_used
+        results[d.isoformat()] = {"count": len(points), "data": points}
+    if not any(r["count"] for r in results.values()):
+        listed = ", ".join(d.isoformat() for d in dates)
         raise HTTPException(
-            status_code=404, detail=f"No price data found for {ticker} over period {period.value}{window}."
+            status_code=404,
+            detail=f"No price data found for {ticker} over period {period.value} ending on {listed}.",
         )
     return {
         "ticker": ticker,
         "symbol": yahoo_symbol,
         "period": period.value,
         "interval": interval_label,
-        "referenceDate": reference_date.isoformat() if reference_date is not None else None,
-        "count": len(points),
-        "data": points,
+        "results": results,
     }
 
 

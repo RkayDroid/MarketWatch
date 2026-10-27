@@ -63,8 +63,9 @@ Upstream cost: **2 requests per call** (`.info` is `quoteSummary` + `quote`).
 ### 2. `GET /stock/{symbol}/historic?period=DAY[&referenceDate=YYYY-MM-DD]` — price series
 
 Default `period=DAY`. Without `referenceDate` the window is the last
-`period` ending now; with `referenceDate` the same window length **ends on
-that date (inclusive)** — see below.
+`period` ending now; with `referenceDate` (one date, or up to 5 separated
+by commas) the same window length **ends on each date (inclusive)** and
+the response is keyed by date — see below.
 
 | period | window | one record per | `datetime` format |
 |---|---|---|---|
@@ -81,7 +82,6 @@ that date (inclusive)** — see below.
   "period": "DAY",
   "symbol": "AAPL",
   "interval": "1h",
-  "referenceDate": null,
   "count": 7,
   "data": [
     { "datetime": "2024-05-01T09:30:00-04:00", "price": 172.34 },
@@ -106,9 +106,9 @@ period fetches the smallest standard Yahoo range that covers it
 (`WEEK`→`1mo`, `MONTH`→`3mo`, `HALF_YEAR`→`1y`, `YEAR`→`2y`,
 `FIVE_YEAR`→`5y`) and slices it to the exact look-back locally.
 
-#### `referenceDate` — end the window on a given date
+#### `referenceDate` — end the window on given date(s)
 
-`GET /stock/AAPL/historic?period=WEEK&referenceDate=2026-10-23`
+`GET /stock/AAPL/historic?period=WEEK&referenceDate=2026-10-23,2026-10-16`
 
 ```json
 {
@@ -116,41 +116,58 @@ period fetches the smallest standard Yahoo range that covers it
   "symbol": "AAPL",
   "period": "WEEK",
   "interval": "1d",
-  "referenceDate": "2026-10-23",
-  "count": 5,
-  "data": [
-    { "datetime": "2026-10-19", "price": 172.34 },
-    { "datetime": "2026-10-20", "price": 173.10 },
-    { "datetime": "2026-10-21", "price": 171.80 },
-    { "datetime": "2026-10-22", "price": 174.02 },
-    { "datetime": "2026-10-23", "price": 175.55 }
-  ]
+  "results": {
+    "2026-10-23": {
+      "count": 5,
+      "data": [
+        { "datetime": "2026-10-19", "price": 172.34 },
+        { "datetime": "2026-10-20", "price": 173.10 },
+        { "datetime": "2026-10-21", "price": 171.80 },
+        { "datetime": "2026-10-22", "price": 174.02 },
+        { "datetime": "2026-10-23", "price": 175.55 }
+      ]
+    },
+    "2026-10-16": {
+      "count": 5,
+      "data": [ { "datetime": "2026-10-12", "price": 170.01 }, "..." ]
+    }
+  }
 }
 ```
 
-* Format `YYYY-MM-DD`. The window is the `period`'s length **ending on
-  `referenceDate`, inclusive**, in calendar days of the exchange's time
-  zone: `DAY` → the hourly bars of that trading date, `WEEK` → the 7 days
-  up to and including it (`2026-10-17`…`2026-10-23` above), `MONTH` → 30
-  days, `HALF_YEAR` → 182, `YEAR` → 365, `FIVE_YEAR` → 5 years. Record
+* **Format:** one `YYYY-MM-DD` date, or up to **5** separated by commas
+  (whitespace around items is ignored). Dates must be **unique**.
+* **Window:** the `period`'s length **ending on each `referenceDate`,
+  inclusive**, in calendar days of the exchange's time zone: `DAY` → the
+  hourly bars of that trading date, `WEEK` → the 7 days up to and
+  including it (`2026-10-17`…`2026-10-23` above), `MONTH` → 30 days,
+  `HALF_YEAR` → 182, `YEAR` → 365, `FIVE_YEAR` → 5 years. Record
   granularity and downsampling are exactly as in the table above; bins are
   anchored at the newest bar of the window, so the last record is the last
-  close on or before `referenceDate`.
-* `referenceDate` is echoed in the response and is `null` for the default
-  rolling window.
+  close on or before the date.
+* **Shape:** whenever `referenceDate` is given — even a single date — the
+  response carries `results`, an object keyed by date **in the order
+  given**, each value `{"count", "data"}`. The common fields (`ticker`,
+  `symbol`, `period`, `interval`) stay at the top level. Without
+  `referenceDate` the flat rolling-window shape above is returned.
+* A date the market was closed (e.g. `DAY` on a Sunday) is reported as
+  `{"count": 0, "data": []}`; the request is `404` only if **every** date
+  is empty. The rolling window's "last 24 bars" fallback does not apply
+  to explicit dates.
 * `ticker` echoes the request; `symbol` is the symbol Yahoo actually
   answered for. They differ only for US share classes typed with a dot
   (`/stock/BRK.B/historic` → `"ticker": "BRK.B", "symbol": "BRK-B"`), the
   same rule the snapshot endpoint applies.
-* `DAY` with a `referenceDate` on which the market was closed is a `404`
-  (there is nothing to show for that day) — the "last 24 bars" fallback
-  only applies to the rolling window.
-* Rejected with `422`, **without any upstream call**: malformed dates,
-  dates in the future, and `DAY` more than ~730 days back (Yahoo keeps
-  hourly bars for 730 days only; daily periods go back decades).
+* Rejected with `422`, **without any upstream call** (the whole list is
+  validated first): more than 5 dates, duplicates, empty items
+  (`a,,b`, trailing comma), malformed dates, impossible dates
+  (`2026-02-30`), dates in the future, and `DAY` more than ~730 days back
+  (Yahoo keeps hourly bars for 730 days only; daily periods go back
+  decades). The message names the offending item.
 
-Upstream cost: **1 request per call**, for exactly the requested window
-(`start`/`end`, hourly bars for `DAY`, daily bars otherwise).
+Upstream cost: **1 request per date**, each for exactly its window
+(`start`/`end`, hourly bars for `DAY`, daily bars otherwise). If the
+hourly budget runs out part-way through a list the whole request is `429`.
 
 ---
 
@@ -201,7 +218,7 @@ intraday resolution. What each API call costs:
 | `/stock/{symbol}` | `quoteSummary` + `quote` (= yfinance `.info`) → **2** |
 | `/historic DAY` | `2d @ 60m` (+ `5d @ 60m` fallback on a long weekend) → **1–2** |
 | `/historic WEEK … FIVE_YEAR` | `1mo / 3mo / 1y / 2y / 5y @ 1d` → **1** |
-| `/historic … &referenceDate=` | `start/end @ 60m` (DAY) or `@ 1d` → **1** |
+| `/historic … &referenceDate=` | `start/end @ 60m` (DAY) or `@ 1d` → **1 per date** (≤ 5) |
 | `/highlow DAY` | `1d @ 5m` (+ `5d` fallback) → **1–2** |
 | `/highlow WEEK` | `5d @ 60m` → **1** |
 | `/highlow MONTH … FIVE_YEAR` | `3mo / 1y / 2y / 5y @ 1d` → **1** |
@@ -250,8 +267,8 @@ routes fine. Yahoo's own convention matters more:
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 110 offline tests, ~7s
-LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 27 opt-in tests against real Yahoo
+pytest                                            # 135 offline tests, ~15s
+LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 28 opt-in tests against real Yahoo
 ```
 
 The offline suite patches `yfinance.Ticker` with a fake whose frames match

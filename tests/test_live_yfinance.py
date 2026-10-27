@@ -105,13 +105,32 @@ def test_live_historic_week_ending_on_reference_date(client):
 
     assert resp.status_code == 200, resp.text
     body = _strict_json(resp.text)
-    assert body["referenceDate"] == reference.isoformat()
-    assert 3 <= body["count"] <= 5
+    assert list(body["results"]) == [reference.isoformat()]
+    result = body["results"][reference.isoformat()]
+    assert 3 <= result["count"] <= 5
     first_day = (reference - timedelta(days=6)).isoformat()
-    assert all(first_day <= p["datetime"] <= reference.isoformat() for p in body["data"])
-    assert body["data"][-1]["datetime"] == reference.isoformat()  # a weekday: inclusive end is present
-    assert all(p["price"] > 0 for p in body["data"])
+    assert all(first_day <= p["datetime"] <= reference.isoformat() for p in result["data"])
+    assert result["data"][-1]["datetime"] == reference.isoformat()  # a weekday: inclusive end is present
+    assert all(p["price"] > 0 for p in result["data"])
     assert before - stock_router._limiter.remaining() == 1  # one live call
+
+
+def test_live_historic_multiple_reference_dates(client):
+    import stock_router
+
+    before = stock_router._limiter.remaining()
+    dates = [_recent_weekday(n) for n in (45, 100, 200)]
+
+    resp = client.get("/stock/AAPL/historic?period=WEEK&referenceDate=" + ",".join(d.isoformat() for d in dates))
+
+    assert resp.status_code == 200, resp.text
+    body = _strict_json(resp.text)
+    assert list(body["results"]) == [d.isoformat() for d in dates]
+    for d in dates:
+        result = body["results"][d.isoformat()]
+        assert 3 <= result["count"] <= 5
+        assert all((d - timedelta(days=6)).isoformat() <= p["datetime"] <= d.isoformat() for p in result["data"])
+    assert before - stock_router._limiter.remaining() == 3  # one live call per date
 
 
 def test_live_historic_day_on_a_past_date_is_that_sessions_hourly_bars(client):
@@ -123,9 +142,10 @@ def test_live_historic_day_on_a_past_date_is_that_sessions_hourly_bars(client):
         assert resp.status_code in (200, 404), resp.text
         if resp.status_code == 200:
             body = _strict_json(resp.text)
+            result = body["results"][reference.isoformat()]
             assert body["interval"] == "1h"
-            assert 6 <= body["count"] <= 8  # a regular NYSE session at hourly bars
-            assert all(p["datetime"].startswith(reference.isoformat()) for p in body["data"])
+            assert 6 <= result["count"] <= 8  # a regular NYSE session at hourly bars
+            assert all(p["datetime"].startswith(reference.isoformat()) for p in result["data"])
             hits += 1
     assert hits, "expected at least one trading day among five weekdays"
 
@@ -143,10 +163,10 @@ def test_live_historic_month_ending_years_ago(client):
     resp = client.get("/stock/AAPL/historic?period=MONTH&referenceDate=2015-03-31")
 
     assert resp.status_code == 200, resp.text
-    body = _strict_json(resp.text)
-    assert 19 <= body["count"] <= 23
-    assert all("2015-03-02" <= p["datetime"] <= "2015-03-31" for p in body["data"])
-    assert body["data"][-1]["datetime"] == "2015-03-31"
+    result = _strict_json(resp.text)["results"]["2015-03-31"]
+    assert 19 <= result["count"] <= 23
+    assert all("2015-03-02" <= p["datetime"] <= "2015-03-31" for p in result["data"])
+    assert result["data"][-1]["datetime"] == "2015-03-31"
 
 
 @pytest.mark.parametrize("period", ["DAY", "WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"])

@@ -100,7 +100,7 @@ three buckets; this section records the design decisions and what changed.
 |---|---|
 | `GET /stock/{symbol}` | **reshaped** to a fixed 10-field snapshot (`ticker, sector, fulldayPrice, currency, symbol, language, longName, exchange, market, displayName`) instead of dumping the whole `.info` dict |
 | `GET /stock/{symbol}/historic?period=` | **replaces** `/hourly` (now `period=DAY`) and the raw `/history` pass-through; adds WEEK/MONTH (daily), HALF_YEAR/YEAR (fortnightly), FIVE_YEAR (monthly) |
-| `GET /stock/{symbol}/historic?period=&referenceDate=` | **added later**: optional `referenceDate=YYYY-MM-DD` makes the `period`-long window end on that date, inclusive (see "referenceDate" below) |
+| `GET /stock/{symbol}/historic?period=&referenceDate=` | **added later**: optional `referenceDate=YYYY-MM-DD[,…]` (up to 5 unique dates) makes the `period`-long window end on each date, inclusive; response keyed by date (see "referenceDate" below) |
 | `GET /stock/{symbol}/highlow?period=` | unchanged contract |
 | `GET /stock/hourly/batch` | **removed** (was a bonus; not in the agreed surface — and it never saved Yahoo quota, see §2) |
 | `mainxx.py` | deleted (PyCharm scaffold, dead code) |
@@ -310,11 +310,40 @@ Whatever is chosen should also decide: stale-on-exhausted-budget,
 negative caching of unknown symbols, and whether multi-worker deployments
 need a shared store (the limiter has the same question).
 
+### `referenceDate` accepts up to 5 dates (latest)
+
+`referenceDate=2026-10-23,2026-10-16` — comma-separated, at most
+`MAX_REFERENCE_DATES = 5`, unique. Decisions:
+
+* **Keyed response whenever `referenceDate` is present**, even for one
+  date: `results: {date: {count, data}}` in the order given, common fields
+  (`ticker`, `symbol`, `period`, `interval`) at the top level. A shape
+  that flips between flat and keyed depending on how many dates were
+  passed would be a trap for clients. The rolling window (no
+  `referenceDate`) keeps the flat shape and lost its vestigial
+  `referenceDate: null`.
+* **Validate the whole list before the first upstream call.** Parsing is
+  done by hand (`Optional[str]` + a strict `YYYY-MM-DD` regex +
+  `date.fromisoformat`) rather than FastAPI's `date` type, so the 422s
+  name the offending item: count > 5, empty item, malformed, impossible
+  calendar date, duplicate (after whitespace stripping), future, DAY
+  beyond retention. Nothing reaches Yahoo for a request that is going to
+  fail on input.
+* **Partial emptiness is data, not an error.** `DAY` on a Sunday next to
+  a trading day gives `{"count": 0, "data": []}` for the Sunday and 200
+  overall; 404 only when every date is empty. Upstream failures
+  (429/502) still fail the whole request — there is no partial-success
+  for those, because the client could not tell which dates were served.
+* **Cost is one call per date**, sequential; the limiter is checked per
+  call, so a list can be cut off by a 429 part-way (documented).
+* `symbol` is taken from any non-empty frame (all dates are the same
+  ticker, so they resolve the same way).
+
 ## 5. Testing
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 110 offline tests, ~7s
+pytest                                            # 135 offline tests, ~15s
 LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 27 opt-in tests against real Yahoo
 ```
 
@@ -361,8 +390,17 @@ the smallest covering Yahoo range (`1mo/3mo/1y/2y/5y`); twelve requests =
 twelve live calls (no cache); 404/429/502 mapping, including 429 with no
 cached fallback.
 
-`test_historic_reference_date.py` — `referenceDate`: echo and exact
-shape; **the yfinance call is made with
+`test_historic_reference_date.py` — `referenceDate`: keyed shape for a
+single date, flat shape without; **multiple dates**: keyed in the order
+given with each result equal to the single-date result, one upstream call
+per date with its own window, five accepted, whitespace tolerated, DAY
+with several dates, a closed day next to a trading day is `count: 0` not
+an error, 404 only when all are empty, 429 part-way fails the whole
+request, dotted symbol reported once; **list validation without upstream
+call**: six dates, duplicates (also with whitespace), empty items
+(`a,,b`, trailing/leading comma, empty, blank), one malformed / future /
+beyond-retention item anywhere in the list, invalid item last after four
+valid ones; **the yfinance call is made with
 `start = referenceDate − (N−1)` and `end = referenceDate + 1` for every
 period** (the one test that pins the inclusive-end contract at the
 upstream boundary); WEEK/MONTH exact records vs the source frame, the

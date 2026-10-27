@@ -10,7 +10,7 @@ from yfinance.exceptions import YFException, YFRateLimitError
 import stock_router
 from tests.conftest import EXCHANGE_TZ, make_ohlc_frame
 
-EXPECTED_KEYS = {"ticker", "symbol", "period", "interval", "referenceDate", "count", "data"}
+EXPECTED_KEYS = {"ticker", "symbol", "period", "interval", "count", "data"}
 
 
 def _strict_json(text: str):
@@ -62,7 +62,6 @@ def test_default_period_is_day(client, fake_yfinance, hourly_30_bars):
     assert body["period"] == "DAY"
     assert body["interval"] == "1h"
     assert body["count"] == len(body["data"])
-    assert body["referenceDate"] is None  # rolling window, no anchor
     assert "X-Cache" not in resp.headers  # nothing is cached
     assert all(set(p) == {"datetime", "price"} for p in body["data"])
 
