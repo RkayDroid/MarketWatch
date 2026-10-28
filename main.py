@@ -5,9 +5,9 @@ import pytz
 
 app = FastAPI(
     title="Market Watch Lite API",
-    version="1.1.0",
+    version="3.0.0",
     description=(
-        "Stock snapshot, price history and high/low data backed by yfinance, "
+        "Stock snapshot and OHLC price history backed by yfinance, "
         "rate limited to stay inside Yahoo Finance's free-tier budget. No caching (yet)."
     ),
 )

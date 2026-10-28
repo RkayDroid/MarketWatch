@@ -121,11 +121,11 @@ def test_removed_routes_are_gone(client):
     assert client.get("/stock/hourly/batch?tickers=AAPL").status_code == 404
 
 
-def test_openapi_lists_exactly_three_stock_routes():
+def test_openapi_lists_exactly_two_stock_routes():
     from main import app
 
     stock_paths = sorted(p for p in app.openapi()["paths"] if p.startswith("/stock"))
-    assert stock_paths == ["/stock/{ticker}", "/stock/{ticker}/highlow", "/stock/{ticker}/historic"]
+    assert stock_paths == ["/stock/{ticker}", "/stock/{ticker}/historic"]
 
 
 def test_status_and_time_endpoints(client):

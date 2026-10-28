@@ -60,55 +60,78 @@ Upstream cost: **2 requests per call** (`.info` is `quoteSummary` + `quote`).
 
 ---
 
-### 2. `GET /stock/{symbol}/historic?period=DAY[&referenceDate=YYYY-MM-DD]` — price series
+### 2. `GET /stock/{symbol}/historic?period=DAY[&referenceDate=…]` — OHLC price series
 
-Default `period=DAY`. Without `referenceDate` the window is the last
-`period` ending now; with `referenceDate` (one date, or up to 5 separated
-by commas) the same window length **ends on each date (inclusive)** and
-the response is keyed by date — see below.
+Default `period=DAY`. The window is defined by one rule:
 
-| period | window | one record per | `datetime` format |
-|---|---|---|---|
-| `DAY` | last 24 hours | hour | ISO-8601 with exchange UTC offset |
-| `WEEK` | last 7 days | trading day | `YYYY-MM-DD` |
-| `MONTH` | last 30 days | trading day | `YYYY-MM-DD` |
-| `HALF_YEAR` | last 6 months | fortnight (14-day bin) | `YYYY-MM-DD` |
-| `YEAR` | last 12 months | fortnight (14-day bin) | `YYYY-MM-DD` |
-| `FIVE_YEAR` | last 5 years | calendar month | `YYYY-MM-DD` |
+> **D′** = the last trading day on or before `referenceDate` (default:
+> today, in the exchange's time zone).
+
+| period | window ending on D′ | bars fetched | one record per | `datetime` format | reach |
+|---|---|---|---|---|---|
+| `DAY` | the session on D′ | hourly | hour (Yahoo's hourly bars start at the open: 09:30, 10:30 … 15:30) | ISO-8601 with exchange UTC offset | ~730 days (Yahoo's hourly retention) |
+| `WEEK` | the **5 sessions** ending on D′ | daily | trading day | `YYYY-MM-DD` | decades |
+| `MONTH` | the **30 calendar days** ending on D′ | daily | trading day | `YYYY-MM-DD` | decades |
+| `HALF_YEAR` | 182 calendar days ending on D′ | daily | fortnight (14-day bin) | `YYYY-MM-DD` | decades |
+| `YEAR` | 365 calendar days ending on D′ | daily | fortnight (14-day bin) | `YYYY-MM-DD` | decades |
+| `FIVE_YEAR` | 5 years (1827 days) ending on D′ | daily | calendar month | `YYYY-MM-DD` | decades |
+
+That is what "1D / 5D" (sessions) and "1M / 6M / 1Y / 5Y" (calendar time
+ending on the last session) mean on any chart.
+
+`GET /stock/AAPL/historic?period=DAY` (Wednesday, 14:00 New York)
 
 ```json
 {
   "ticker": "AAPL",
-  "period": "DAY",
   "symbol": "AAPL",
+  "period": "DAY",
   "interval": "1h",
-  "count": 7,
+  "referenceDate": "2026-10-21",
+  "window": {"start": "2026-10-21", "end": "2026-10-21"},
+  "count": 5,
   "data": [
-    { "datetime": "2024-05-01T09:30:00-04:00", "price": 172.34 },
-    { "datetime": "2024-05-01T10:30:00-04:00", "price": 172.91 }
+    {"datetime": "2026-10-21T09:30:00-04:00", "open": 221.54, "high": 221.56, "low": 221.54, "close": 221.55},
+    {"datetime": "2026-10-21T10:30:00-04:00", "open": 221.55, "high": 221.56, "low": 221.54, "close": 221.55},
+    "...",
+    {"datetime": "2026-10-21T13:30:00-04:00", "open": 221.55, "high": 221.56, "low": 221.54, "close": 221.55}
   ]
 }
 ```
 
-* `price` is the bar's **Close**. For fortnight/month records it is the close
-  of the last trading day in that bin and `datetime` is that day. Bins are
-  anchored at the newest bar, so the final record is always the latest close.
-* `interval` is `1h`, `1d`, `2wk` or `1mo`.
-* Day-or-coarser records carry a date only (there is no meaningful time for
-  a daily close) — the same convention as `/highlow`.
-* `DAY` during a long weekend: if nothing traded in the last 24h the most
-  recent 24 hourly bars are returned rather than an empty list.
-* Records exist only for trading days; weekends/holidays are absent.
-
-Upstream cost: **1 request per call.** `DAY` fetches 2 days of hourly bars
-(a second request falls back to 5 days on a long weekend); each daily
-period fetches the smallest standard Yahoo range that covers it
-(`WEEK`→`1mo`, `MONTH`→`3mo`, `HALF_YEAR`→`1y`, `YEAR`→`2y`,
-`FIVE_YEAR`→`5y`) and slices it to the exact look-back locally.
+* **Each record is one bar's Open / High / Low / Close** (`high`/`low` are
+  the true traded extremes of the bar, not closes). The window's high and
+  low are therefore `max(high)` and `min(low)` over `data`, and the record
+  they sit in says when — to the hour for `DAY`, to the day otherwise.
+  Fortnight/month records are **aggregates of their bin**: first open,
+  highest high, lowest low, last close, stamped with the bin's last
+  trading day; bins are anchored at the newest bar, so the final record
+  always ends on the window's last close. `DAY` includes the running
+  hourly bar while the market is open. A bar without a close is skipped;
+  a missing open/high/low is `null`.
+* `interval` is the record granularity: `1h`, `1d`, `2wk` or `1mo`.
+* **A weekend or holiday never comes back empty**: `referenceDate=2026-10-18`
+  (a Sunday) is served as the window ending Friday 2026‑10‑16, and the
+  response says so. Without `referenceDate`, "today" follows the same rule:
+  during the session the window ends on today's partial session; before
+  the open, or on a weekend, on the previous session.
+* Every response carries **`referenceDate`** (the date asked for, or today)
+  and **`window: {start, end}`** — exchange-local dates, both inclusive.
+  `end` is D′. `start` is the first session of a `DAY`/`WEEK` window, and
+  `end − 29 / 181 / 364 / 1826 days` for the calendar periods whether or
+  not that day traded.
+* `ticker` echoes the request; `symbol` is the symbol Yahoo actually
+  answered for. They differ only for US share classes typed with a dot
+  (`/stock/BRK.B/historic` → `"ticker": "BRK.B", "symbol": "BRK-B"`).
 
 #### `referenceDate` — end the window on given date(s)
 
-`GET /stock/AAPL/historic?period=WEEK&referenceDate=2026-10-23,2026-10-16`
+One `YYYY-MM-DD`, or up to **5** unique dates separated by commas
+(whitespace tolerated). The response is then keyed by the dates **as
+given**, in the order given, under `results`:
+
+`GET /stock/AAPL/historic?period=WEEK&referenceDate=2026-10-18` (a Sunday;
+Wednesday 2026‑10‑14 was a holiday, so the 5 sessions span 8 days)
 
 ```json
 {
@@ -117,86 +140,34 @@ period fetches the smallest standard Yahoo range that covers it
   "period": "WEEK",
   "interval": "1d",
   "results": {
-    "2026-10-23": {
+    "2026-10-18": {
+      "window": {"start": "2026-10-09", "end": "2026-10-16"},
       "count": 5,
       "data": [
-        { "datetime": "2026-10-19", "price": 172.34 },
-        { "datetime": "2026-10-20", "price": 173.10 },
-        { "datetime": "2026-10-21", "price": 171.80 },
-        { "datetime": "2026-10-22", "price": 174.02 },
-        { "datetime": "2026-10-23", "price": 175.55 }
+        {"datetime": "2026-10-09", "open": 221.2,  "high": 221.22, "low": 221.19, "close": 221.21},
+        {"datetime": "2026-10-12", "open": 221.28, "high": 221.31, "low": 221.28, "close": 221.3},
+        {"datetime": "2026-10-13", "open": 221.31, "high": 221.34, "low": 221.31, "close": 221.33},
+        {"datetime": "2026-10-15", "open": 221.37, "high": 221.39, "low": 221.37, "close": 221.38},
+        {"datetime": "2026-10-16", "open": 221.4,  "high": 221.42, "low": 221.4,  "close": 221.41}
       ]
-    },
-    "2026-10-16": {
-      "count": 5,
-      "data": [ { "datetime": "2026-10-12", "price": 170.01 }, "..." ]
     }
   }
 }
 ```
 
-* **Format:** one `YYYY-MM-DD` date, or up to **5** separated by commas
-  (whitespace around items is ignored). Dates must be **unique**.
-* **Window:** the `period`'s length **ending on each `referenceDate`,
-  inclusive**, in calendar days of the exchange's time zone: `DAY` → the
-  hourly bars of that trading date, `WEEK` → the 7 days up to and
-  including it (`2026-10-17`…`2026-10-23` above), `MONTH` → 30 days,
-  `HALF_YEAR` → 182, `YEAR` → 365, `FIVE_YEAR` → 5 years. Record
-  granularity and downsampling are exactly as in the table above; bins are
-  anchored at the newest bar of the window, so the last record is the last
-  close on or before the date.
-* **Shape:** whenever `referenceDate` is given — even a single date — the
-  response carries `results`, an object keyed by date **in the order
-  given**, each value `{"count", "data"}`. The common fields (`ticker`,
-  `symbol`, `period`, `interval`) stay at the top level. Without
-  `referenceDate` the flat rolling-window shape above is returned.
-* A date the market was closed (e.g. `DAY` on a Sunday) is reported as
-  `{"count": 0, "data": []}`; the request is `404` only if **every** date
-  is empty. The rolling window's "last 24 bars" fallback does not apply
-  to explicit dates.
-* `ticker` echoes the request; `symbol` is the symbol Yahoo actually
-  answered for. They differ only for US share classes typed with a dot
-  (`/stock/BRK.B/historic` → `"ticker": "BRK.B", "symbol": "BRK-B"`), the
-  same rule the snapshot endpoint applies.
-* Rejected with `422`, **without any upstream call** (the whole list is
-  validated first): more than 5 dates, duplicates, empty items
-  (`a,,b`, trailing comma), malformed dates, impossible dates
-  (`2026-02-30`), dates in the future, and `DAY` more than ~730 days back
-  (Yahoo keeps hourly bars for 730 days only; daily periods go back
-  decades). The message names the offending item.
-
-Upstream cost: **1 request per date**, each for exactly its window
-(`start`/`end`, hourly bars for `DAY`, daily bars otherwise). If the
-hourly budget runs out part-way through a list the whole request is `429`.
-
----
-
-### 3. `GET /stock/{symbol}/highlow?period=WEEK` — highest / lowest traded price
-
-Default `period=WEEK`.
-
-```json
-{
-  "symbol": "AAPL",
-  "period": "WEEK",
-  "high": 195.12,
-  "highOccured": "2024-05-01T10:00:00-04:00",
-  "low": 188.4,
-  "lowOccured": "2024-04-29T15:00:00-04:00"
-}
-```
-
-* `high`/`low` are the bar **High/Low** (true traded extremes, not closes).
-* `*Occured` precision follows the bar size:
-
-| period | bars | `*Occured` |
-|---|---|---|
-| `DAY` | last session @ 5-minute bars | 5-min bar start, ISO-8601 w/ offset |
-| `WEEK` | last 5 trading days @ hourly bars | hourly bar start, ISO-8601 w/ offset |
-| `MONTH`, `HALF_YEAR`, `YEAR`, `FIVE_YEAR` | daily bars (smallest covering Yahoo range, sliced) | `YYYY-MM-DD` |
-
-Upstream cost: **1 request per call** (`DAY` may need a second one on a
-weekend).
+* A date on or before which nothing ever traded (before the listing) is
+  `null`; the request is `404` only if **every** date is null.
+* Rejected with `422`, **before any upstream call** (the whole list is
+  validated first, the message names the item): more than 5 dates,
+  duplicates, empty items (`a,,b`, trailing comma), malformed or
+  impossible dates (`2026-02-30`), dates in the future, and `DAY` windows
+  older than Yahoo's ~730-day hourly retention. A date one day ahead of
+  UTC is accepted so exchanges east of UTC can ask for their current local
+  date.
+* **Upstream cost: 1 request per window** (one per date), a `start/end`
+  call covering the window plus a 14‑day look-back from which D′ is
+  resolved. If the hourly budget runs out part-way through a list the
+  whole request is `429`.
 
 ---
 
@@ -216,16 +187,13 @@ intraday resolution. What each API call costs:
 | API call | Yahoo call(s) |
 |---|---|
 | `/stock/{symbol}` | `quoteSummary` + `quote` (= yfinance `.info`) → **2** |
-| `/historic DAY` | `2d @ 60m` (+ `5d @ 60m` fallback on a long weekend) → **1–2** |
-| `/historic WEEK … FIVE_YEAR` | `1mo / 3mo / 1y / 2y / 5y @ 1d` → **1** |
-| `/historic … &referenceDate=` | `start/end @ 60m` (DAY) or `@ 1d` → **1 per date** (≤ 5) |
-| `/highlow DAY` | `1d @ 5m` (+ `5d` fallback) → **1–2** |
-| `/highlow WEEK` | `5d @ 60m` → **1** |
-| `/highlow MONTH … FIVE_YEAR` | `3mo / 1y / 2y / 5y @ 1d` → **1** |
+| `/historic` | `start/end @ 60m` (DAY) or `@ 1d` → **1 per window** (one per `referenceDate`, ≤ 5) |
 
-Dotted symbols that need the dash retry pay once more. yfinance itself
-adds a one-off, uncounted timezone-lookup request the first time a process
-sees a symbol via `start`/`end`.
+Every window is one `start/end` call: the period's nominal span plus a
+14-day look-back (so D′ can be resolved from the bars that come back),
+clamped to Yahoo's retention for the bar size. Dotted symbols that need
+the dash retry pay once more. yfinance itself adds a one-off, uncounted
+timezone-lookup request the first time a process sees a symbol.
 
 * **No cache**: request volume on the API maps 1:1 onto Yahoo traffic. This
   is intentional for now — the earlier two-tier cache (memory + SQLite)
@@ -255,27 +223,30 @@ routes fine. Yahoo's own convention matters more:
 * **US share classes use a dash on Yahoo** — `BRK-B`, `BF-B` — while most
   people type `BRK.B`. When a dotted symbol returns nothing, the request is
   retried once with dots replaced by dashes (a second, budget-charged
-  call). This applies to every endpoint - snapshot, historic (with or
-  without `referenceDate`) and highlow all go through the same retry - and
-  fires whether yfinance signals "unknown symbol" with an empty frame (its
+  call). This applies to both endpoints - snapshot and historic go
+  through the same retry - and fires whether yfinance signals "unknown symbol" with an empty frame (its
   default) or by raising (`yf.config.debug.hide_exceptions = False`). The
-  `ticker` field echoes the symbol the client asked for; the snapshot's and
-  historic's `symbol` field shows Yahoo's canonical (dashed) form so the
-  translation is visible.
+  `ticker` field echoes the symbol the client asked for; the `symbol` field
+  shows Yahoo's canonical (dashed) form so the translation is visible.
 
 ## Tests
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 135 offline tests, ~15s
-LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 28 opt-in tests against real Yahoo
+pytest                                            # 145 offline tests, ~10s
+LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 24 opt-in tests against real Yahoo
 ```
 
-The offline suite patches `yfinance.Ticker` with a fake whose frames match
-the real library's shape (tz-aware `Date`/`Datetime` index, `int64` Volume,
-`Dividends`/`Stock Splits` columns, NaNs) and runs requests through the full
-FastAPI stack including JSON rendering. The live tests need network access
-and a handful of real requests.
+The offline suite patches `yfinance.Ticker` with a fake backed by a
+synthetic exchange (`tests/conftest.py: FakeMarket`): weekday sessions
+09:30–16:00 minus a holiday and a 9-day closure, with daily and hourly
+frames that are true aggregations of one price path (so the two bar
+sizes agree exactly, including the partial running session), shaped like
+the real library's frames (tz-aware `Date`/`Datetime` index, `int64`
+Volume, `Dividends`/`Stock Splits` columns). `test_window_rule.py` covers
+the window rule, `test_historic_endpoint.py` the records (OHLC per bar,
+bin aggregation, NaN handling). The live tests need network access and a
+handful of real requests.
 
 ## Layout
 
@@ -285,4 +256,5 @@ stock_router.py    the /stock endpoints and all yfinance access
 rate_limit.py      SlidingWindowRateLimiter (stdlib only)
 tests/             offline suite + opt-in live tests
 EVALUATION.md      original project evaluation, yfinance option analysis, change history
+prior-changes/     before/after notes per round; start with SUMMARY-baseline-to-now.md
 ```

@@ -100,8 +100,9 @@ three buckets; this section records the design decisions and what changed.
 |---|---|
 | `GET /stock/{symbol}` | **reshaped** to a fixed 10-field snapshot (`ticker, sector, fulldayPrice, currency, symbol, language, longName, exchange, market, displayName`) instead of dumping the whole `.info` dict |
 | `GET /stock/{symbol}/historic?period=` | **replaces** `/hourly` (now `period=DAY`) and the raw `/history` pass-through; adds WEEK/MONTH (daily), HALF_YEAR/YEAR (fortnightly), FIVE_YEAR (monthly) |
-| `GET /stock/{symbol}/historic?period=&referenceDate=` | **added later**: optional `referenceDate=YYYY-MM-DD[,…]` (up to 5 unique dates) makes the `period`-long window end on each date, inclusive; response keyed by date (see "referenceDate" below) |
-| `GET /stock/{symbol}/highlow?period=` | unchanged contract |
+| `GET /stock/{symbol}/historic?period=&referenceDate=` | **added later**: optional `referenceDate=YYYY-MM-DD[,…]` (up to 5 unique dates) makes the window end on each date; response keyed by date |
+| `GET /stock/{symbol}/highlow?period=[&referenceDate=]` | was unchanged, then gained `referenceDate`, then shared the window rule — **removed in the latest round**: its information (the window's traded extremes) is now in `/historic`'s OHLC records |
+| `GET /stock/{symbol}/historic` | **latest**: one window rule, rolling included — D′ = last trading day on or before the reference date; `DAY` = that session, `WEEK` = 5 sessions, longer periods calendar time; every response carries `referenceDate` + `window`; **records are OHLC** (see "One window rule" and "OHLC records" below) |
 | `GET /stock/hourly/batch` | **removed** (was a bonus; not in the agreed surface — and it never saved Yahoo quota, see §2) |
 | `mainxx.py` | deleted (PyCharm scaffold, dead code) |
 
@@ -121,7 +122,7 @@ three buckets; this section records the design decisions and what changed.
   `regularMarketPrice / currentPrice / longName / shortName` — unknown
   symbols come back from yfinance as a near-empty dict, not an error.
 
-### Historic decisions
+### Historic decisions *(the window definitions here are historical; see "One window rule")*
 * **One shared 5-year daily frame per symbol** (`5y @ 1d`, ~1260 rows)
   serves `WEEK`, `MONTH`, `HALF_YEAR`, `YEAR`, `FIVE_YEAR` *and* the four
   long `/highlow` periods. Yahoo has no fortnightly interval and retains
@@ -143,10 +144,10 @@ three buckets; this section records the design decisions and what changed.
 * `window_hours` was dropped from the response in favour of `period` +
   `interval` (`1h`, `1d`, `2wk`, `1mo`).
 
-### Highlow decisions (unchanged)
-* `high`/`low` are bar High/Low (true traded extremes), numbers not strings.
-* `DAY` = last session at 5-minute bars (fallback `5d`, last session only);
-  `WEEK` = `5d @ 60m`; longer periods slice the shared daily frame.
+### Highlow decisions *(endpoint removed — see "OHLC records")*
+* `high`/`low` were bar High/Low (true traded extremes), numbers not
+  strings; `DAY` at 5-minute bars, `WEEK` at hourly bars, longer periods
+  at daily bars.
 
 ### Two-tier cache (added later, simplified on review — **since removed, see "Reset" below**)
 
@@ -339,6 +340,158 @@ need a shared store (the limiter has the same question).
 * `symbol` is taken from any non-empty frame (all dates are the same
   ticker, so they resolve the same way).
 
+### `referenceDate` on `/highlow` (superseded by "One window rule" below)
+
+`highlow?period=X&referenceDate=2026-10-23[,…]` — the same parameter,
+parser, list rules (≤ 5, unique, validated before any call) and window
+semantics as `/historic`, so a client can ask both endpoints the same
+question about the same window. Decisions:
+
+* **Bar size follows the period, not the anchoring.** The rolling window
+  uses 5-minute bars for `DAY`, hourly for `WEEK`, daily beyond; an
+  anchored window uses the same, so `*Occured` precision is identical
+  either way. One `history(start, end, interval)` call per date through
+  the existing `_fetch_window` / `_fetch_chart` choke point (limiter,
+  error mapping and the `BRK.B`→`BRK-B` retry apply unchanged), then the
+  local `_slice_window` guarantee and the unchanged `_compute_extremes`.
+* **Retention is per bar size, so per endpoint.** Yahoo keeps 5-minute
+  bars ~60 days and hourly bars ~730 days (yfinance encodes both). The
+  single `_validate_reference_date` now takes the endpoint's retention
+  table: `/historic` rejects `DAY` > 730 days; `/highlow` rejects `DAY` >
+  60 days and `WEEK` > 730 days. The 422 names the bar size and the limit
+  and suggests the next period up. `/historic`'s messages are unchanged.
+* **`WEEK` anchored = 7 calendar days** (as `/historic`), while rolling
+  `WEEK` is Yahoo's `5d` = 5 trading days. Identical in a normal week;
+  around an exchange holiday the anchored window has one trading day
+  less. Documented rather than special-cased — "7 days ending on the
+  date" is the predictable contract.
+* **Keyed response whenever `referenceDate` is present**, like
+  `/historic`: `results: {date: {high, highOccured, low, lowOccured}}`,
+  `symbol` and `period` at the top level. A date with no bars is
+  **`null`** (the scalar analogue of `/historic`'s `{count: 0, data: []}`
+  — a record with four null fields would make every field nullable for
+  clients); 404 only when every date is empty. No "previous session"
+  fallback for an explicit closed date.
+* `symbol` keeps echoing the requested symbol, as the rolling `/highlow`
+  response always has; `/historic`'s `ticker`/`symbol` split (Yahoo's
+  dashed form in `symbol`) was not extended here to avoid changing the
+  existing `/highlow` contract — worth unifying if the snapshot/historic
+  convention is confirmed.
+
+### One window rule for both endpoints (latest)
+
+The two endpoints had drifted into three meanings of `DAY` (24 absolute
+hours on `/historic`, the latest session on `/highlow`, a calendar date
+with `referenceDate`) and two of `WEEK` (5 sessions rolling, 7 calendar
+days anchored), because rolling windows used Yahoo *ranges* (`5d`,
+`1mo`… — session-counted, ending now) while anchored ones used
+`start/end` (calendar days). A `/highlow` answer is a single number, so a
+boundary difference that is cosmetic on a price series flips the result
+there — which is where the inconsistency became visible.
+
+**The rule (now the only one, rolling = anchored at today):**
+
+> D′ = the last trading day on or before `referenceDate` (default: the
+> exchange's today). `DAY` = the session on D′; `WEEK` = the 5 sessions
+> ending on D′; `MONTH` / `HALF_YEAR` / `YEAR` / `FIVE_YEAR` = 30 / 182 /
+> 365 / 1827 calendar days ending on D′.
+
+Why this shape:
+
+* It is what every charting UI's range buttons mean (1D/5D count
+  sessions, 1M…5Y count calendar time ending on the last session), and
+  "last value on or before the date" is the universal as-of convention —
+  so a Sunday resolves to Friday instead of coming back empty. None of
+  this is Yahoo-specific; only the retention numbers and the bar
+  alignment are.
+* One rule kills all the special cases: the `2d→5d` / `1d→5d` fallbacks,
+  the "last 24 bars" fallback, `_slice_lookback` in UTC, the Yahoo-range
+  table, `null` for weekend dates. `_resolve_window` + `_load_window` +
+  `_serve` replace them; both endpoints are now a bar-size table and a
+  `view` function over the same flow.
+* `/historic` and `/highlow` keep their own bar sizes (hourly/daily vs
+  5-minute/hourly/daily). A shared frame was considered and rejected:
+  deriving daily closes from intraday bars would not give Yahoo's
+  official close, and `/historic DAY` would lose 670 days of reach. The
+  window is shared; the bar size only sets `*Occured` precision and the
+  retention horizon, both reported (`interval`) or documented.
+
+**Resolution without an exchange calendar.** One `start/end` call covers
+the nominal span plus `RESOLUTION_LOOKBACK_DAYS = 14` (the longest known
+exchange closures — Golden Week, the 2001 NYSE closure — fit), clamped to
+the retention horizon because Yahoo rejects a `start` beyond it; D′ is
+the newest bar date ≤ the reference date, the window is cut from the
+returned bars. For the rolling case the exchange's "today" is not known
+before the call, so the call asks up to UTC tomorrow and the newest bar
+is D′; the reported `referenceDate` is then the exchange-local today,
+read from the frame's time zone. `exchange_calendars` would make this
+exact and remove the look-back; not added to avoid a dependency until
+needed. Consequence at the edges: a date more than 14 days after the last
+session (a closure longer than any known) or a weekend date exactly at
+the retention edge resolves to nothing and is `null`/404.
+
+**Validation** stays up front: future dates, list rules, and retention
+checked on the window's *nominal start* (`DAY` on `/highlow` ≤ 60 days,
+`WEEK` on `/highlow` ≤ 730 − 6 days, `DAY` on `/historic` ≤ 730 days).
+
+**Envelope.** Both endpoints: `ticker`, `symbol` (Yahoo's form),
+`period`, `interval`, then `referenceDate` + `window` + payload (flat,
+no `referenceDate` param) or `results: {date: {window, …payload} | null}`
+(keyed, with the param). `/highlow` gained `ticker`/`interval`, and its
+`symbol` now means what it means everywhere else (Yahoo's dashed form).
+`/historic`'s empty entry changed from `{count: 0, data: []}` to `null`
+— with the as-of rule an empty entry only happens before the listing,
+and one representation for both endpoints was preferred.
+
+**Behaviour changes for existing clients** (all documented in
+`prior-changes/window-rule-changes.md`): rolling `/historic DAY` is now
+the current/last session rather than 24 absolute hours; rolling
+`/highlow WEEK` is the 5 sessions ending on the last session (it was
+Yahoo's `5d`, the same thing); `/historic WEEK` is 5 sessions instead of
+7 calendar days (identical except across a holiday); a `referenceDate`
+on a non-trading day resolves instead of being empty. App version bumped
+to 2.0.0.
+
+**Also fixed on the way:** `_last_per_bin` measured bar age with
+tz-aware timestamp subtraction, so fortnight bins shifted by one day
+across a DST change; it now uses exchange-local calendar dates like the
+rest of the rule.
+
+### OHLC records, `/highlow` removed (latest)
+
+With the shared window rule in place the remaining question was whether
+`/historic`'s `price` at `highOccured` should equal `/highlow`'s `high`.
+It could not: `price` was a Close, `high` a bar High; `/highlow` used
+finer bars for `DAY`/`WEEK` so there was often no `/historic` record at
+that timestamp at all; and the fortnight/month downsampling kept only
+one bar per bin, so the day of the extreme was frequently not in the
+series. The honest fix is to stop pretending a Close series can answer a
+High/Low question: **every `/historic` record now carries the bar's
+`open` / `high` / `low` / `close`**, and `/highlow` is gone.
+
+* `price` → `close`, alongside `open`, `high`, `low`. Standard OHLC; no
+  field whose meaning has to be explained.
+* Downsampling became **OHLC aggregation**: a fortnight/month record is
+  its bin's first open, highest high, lowest low, last close, stamped
+  with the bin's last trading day (unchanged stamp, unchanged anchoring).
+  So `max(high)` / `min(low)` over any series are the true extremes of
+  the window at the period's bar size — exactly what `/highlow` used to
+  return — and the record they sit in says when.
+* What was lost: the *precision* of "when". `/highlow` fetched 5-minute
+  bars for `DAY` and hourly for `WEEK` solely to time-stamp the extreme;
+  `/historic` keeps hourly for `DAY` and daily otherwise, so the extreme
+  is now known to the hour / to the day. If finer timing is ever needed
+  the right answer is `interval` as a parameter, not a second endpoint.
+* NaN: a bar without a Close is skipped (as before); a missing
+  Open/High/Low is `null` rather than dropping the bar. Within a bin the
+  aggregate skips NaNs.
+* Removed with the endpoint: `SESSION_INTERVAL`, `SESSION_RETENTION_DAYS`,
+  `_compute_extremes`, `_format_occurrence`, the per-endpoint `Bars`
+  tables and the `view` indirection (`_serve` now takes one `render`),
+  the 5-minute frame of the test market, `test_highlow_endpoint.py`, and
+  the endpoint parametrisation of `test_window_rule.py`. App version
+  3.0.0.
+
 ## 5. Testing
 
 ```
@@ -379,64 +532,67 @@ yfinance returns for unknown symbols; 429 when the budget can't cover both
 halves of `.info`; removed routes return 404; OpenAPI lists exactly the
 three `/stock` routes.
 
-`test_historic_endpoint.py` — default `DAY`; case-insensitive period; 422
-with zero upstream calls; DAY rolling-24h slicing/order/tz, `2d→5d` fallback
-charged twice, stale-market fallback, NaN closes skipped; WEEK/MONTH exact
-trading-day records vs the source frame; HALF_YEAR/YEAR fortnight records
-(~13/~26, ~14 days apart, each a real trading-day close, latest record is
-the latest close, all inside the window); FIVE_YEAR exactly one record per
-calendar month equal to the month-end close; each daily period fetches
-the smallest covering Yahoo range (`1mo/3mo/1y/2y/5y`); twelve requests =
-twelve live calls (no cache); 404/429/502 mapping, including 429 with no
-cached fallback.
+`tests/conftest.py` — `FakeMarket`: a synthetic exchange (weekday
+sessions 09:30–16:00, a Wednesday holiday ~3 weeks back, a 9-day closure
+~300 days back, a freezable clock) whose daily and hourly frames are
+true aggregations of one price path, so the two bar sizes agree exactly,
+the running session is partial at both, and the newest bar of any window
+holds its High. Hourly bars are 09:30-anchored like Yahoo's.
 
-`test_historic_reference_date.py` — `referenceDate`: keyed shape for a
-single date, flat shape without; **multiple dates**: keyed in the order
-given with each result equal to the single-date result, one upstream call
-per date with its own window, five accepted, whitespace tolerated, DAY
-with several dates, a closed day next to a trading day is `count: 0` not
-an error, 404 only when all are empty, 429 part-way fails the whole
-request, dotted symbol reported once; **list validation without upstream
-call**: six dates, duplicates (also with whitespace), empty items
-(`a,,b`, trailing/leading comma, empty, blank), one malformed / future /
-beyond-retention item anywhere in the list, invalid item last after four
-valid ones; **the yfinance call is made with
-`start = referenceDate − (N−1)` and `end = referenceDate + 1` for every
-period** (the one test that pins the inclusive-end contract at the
-upstream boundary); WEEK/MONTH exact records vs the source frame, the
-reference date itself included and the day before the window excluded;
-HALF_YEAR/YEAR fortnights and FIVE_YEAR months confined to the window with
-the window's last close as the last record; `referenceDate=today` equals
-the rolling window; **DAY**: exactly that exchange-local date's bars, DST
-day has 23/25 bars, closed day = 404 (no 24-bar fallback), NaN closes
-skipped; bars outside the window returned by upstream are dropped; **no
-caching**: three identical requests = three live calls, rolling and
-anchored windows are independent calls; **422 without
-upstream call** for future/too-old/malformed dates, `tomorrow` accepted
-for exchanges ahead of UTC; 404/429/502 mapping; `BRK.B` → `BRK-B` retry.
+`test_window_rule.py` (102) — D′ resolution: weekday → itself,
+Saturday/Sunday → Friday, holiday → the day before, inside the closure →
+the Friday before it, the results key is the date as given; `DAY` = one
+session; `WEEK` = 5 sessions (Mon–Fri, from a weekend, Tue–Mon, across
+the holiday = 8 calendar days); calendar periods = N days ending on D′
+with a calendar `start` even on a weekend; for every period and
+reference (weekday, Sunday, holiday, closure) `max(high)` / `min(low)`
+over the records equal the true extremes of the window's bars; **rolling**
+with a frozen clock: mid-session = today's partial session (running
+hourly bar included), before the open = yesterday, Sunday = Friday,
+rolling == `referenceDate=today`, Tokyo's local today at 23:30 UTC; the
+upstream call is `[D − span + 1 − 14, D + 1)` at the period's bar size,
+clamped to the hourly horizon, one call per window, rolling asks up to
+UTC tomorrow; bars outside the window returned by upstream are dropped;
+multi-date order, per-date equality with single-date, 5 ok, 6 rejected,
+one call per date, pre-listing date `null` beside a served one, all-null
+404, 429 mid-list; every list-validation 422 without a call; `DAY`
+accepted at the 730-day boundary and 422 one day past it, daily periods
+fine in 2015; no caching; 404/429/502 mapping; `BRK.B` → `BRK-B`
+(empty-frame and raising variants), unknown dotted 404, exchange
+suffixes passed through; `/highlow` is 404.
 
-`test_highlow_endpoint.py` — exact 6-key shape; High/Low selection with bar
-timestamps; DAY session fallback; planted extremes 100/200/400 days back
-resolve differently per window; each daily period = one call for its
-covering range, six periods = six calls; NaN handling; 429s (no cached
-fallback); route isolation.
+`test_historic_endpoint.py` (27) — exact 8-key response / 5-key record
+shape with `low ≤ open, close ≤ high`; `DAY` = the session's
+09:30-anchored hourly OHLC bars with offset, the running bar while open,
+a planted session high sits in the hourly bar it happened in (and the
+close stays the close), the neighbouring sessions' bars are excluded;
+`WEEK` = one OHLC record per session, the sixth session back and the
+next session excluded, the first session in; `MONTH` = every session in
+30 days, first day in, day before out; `HALF_YEAR`/`YEAR` = one
+aggregate per 14-day bin counted back from the newest bar (first open,
+max high incl. a mid-bin spike, min low, last close, stamped with the
+bin's last session — correct across the closure and DST); `FIVE_YEAR` =
+one aggregate per calendar month + the partial current month; interval
+labels; NaN: bars without a close skipped, missing high → `null`, NaN
+bars skipped inside a bin, all-NaN 404; 422 for a bad period without a
+call; the exchange's today as `referenceDate`.
 
 `test_rate_limit.py` — `SlidingWindowRateLimiter` (cap, sliding window,
 `retry_after`, zero-budget guard, thread-safety) with a fake clock.
 
-`test_dotted_tickers.py` — dotted symbols through the API: exchange
-suffixes direct and reported unchanged, `BRK.B`→`BRK-B` fallback on
-historic / highlow / snapshot with budget accounting and `symbol`
-reporting the dashed form, the fallback also firing when yfinance raises
-instead of returning empty, 404 after both forms fail.
+`test_dotted_tickers.py` — exchange suffixes route and resolve directly;
+`BRK.B` → `BRK-B` rolling and anchored with budget accounting (the retry
+is charged) and `symbol` reporting the dashed form; snapshot fallback;
+unknown dotted symbol 404 after both forms.
 
-`test_live_yfinance.py` — opt-in: snapshot for AAPL/VTI/unknown, historic
-for all six periods, one upstream call per request against real Yahoo,
-highlow for all six periods; `referenceDate`:
-a WEEK ending on a past weekday (last record == referenceDate, one live
-call), past-date DAY sessions (6–8 hourly bars, all on
-that date), 422 beyond hourly retention with no call, a MONTH ending
-2015-03-31.
+`test_live_yfinance.py` — opt-in (24): snapshot for AAPL/VTI/unknown;
+for every period, rolling `/historic` (window ends on a recent weekday,
+OHLC records inside it and sane, DAY = one session, WEEK = 5 records);
+a YEAR's last fortnight record carries the same extremes as the daily
+bars of a MONTH window over the same days; 6 windows = 6 calls;
+`/highlow` is 404; a WEEK ending on a past weekday; a Sunday resolving to
+Friday's hourly bars; three dates = three calls; 422 beyond retention
+with no call; a MONTH ending 2015-03-31; 1970 = `null`.
 
 ## 6. Other clean-ups made
 

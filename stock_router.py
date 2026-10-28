@@ -2,12 +2,27 @@
 Stock endpoints.
 
     GET /stock/{symbol}                         snapshot: name, sector, price, exchange...
-    GET /stock/{symbol}/historic?period=        price series (hourly / daily / fortnightly / monthly)
-                              &referenceDate=   ...the same window ending ON that date (or on each of
-                                                up to 5 comma-separated dates) instead of now
-    GET /stock/{symbol}/highlow?period=         highest & lowest traded price and when
+    GET /stock/{symbol}/historic?period=        OHLC series (hourly / daily / fortnightly / monthly)
+                              &referenceDate=   ...the window ends on that date (or on each of up to 5
+                                                comma-separated dates) instead of today
 
-There is NO caching in this version: every request is exactly one live
+The window is defined by one rule (`_resolve_window`):
+
+    D' = the last trading day on or before `referenceDate` (default: today)
+
+    DAY        the session on D'
+    WEEK       the 5 sessions ending on D'
+    MONTH      the 30 calendar days ending on D'
+    HALF_YEAR  182 days         "
+    YEAR       365 days         "
+    FIVE_YEAR  5 years          "
+
+Every record carries the bar's open / high / low / close, so the window's
+traded extremes are `max(high)` / `min(low)` over the series, and the
+response carries `referenceDate` (what was asked, or today) and `window`
+(what was served, `start`..`end` inclusive, exchange-local dates).
+
+There is NO caching in this version: every window is exactly one live
 yfinance chart call (two for `.info`, plus one retry for dotted symbols),
 so what a client asks for maps 1:1 onto Yahoo Finance traffic. A caching
 layer is deliberately deferred until the use cases are settled. The only
@@ -18,8 +33,9 @@ hard-caps upstream calls per hour and answers 429 beyond that.
 import re
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from fastapi import APIRouter, HTTPException, Query
@@ -44,7 +60,7 @@ _limiter = SlidingWindowRateLimiter(max_calls=UPSTREAM_CALL_BUDGET_PER_HOUR, win
 
 
 class Period(str, Enum):
-    """Look-back window accepted by /historic and /highlow (case-insensitive)."""
+    """Look-back window accepted by /historic (case-insensitive)."""
 
     DAY = "DAY"
     WEEK = "WEEK"
@@ -63,36 +79,50 @@ class Period(str, Enum):
         return None
 
 
-# Calendar-day length of each period's window.
-_LOOKBACK_DAYS = {
+# --------------------------------------------------------------------------
+# The window rule
+#
+# Short periods count SESSIONS (what every "1D / 5D" chart button means),
+# long periods count CALENDAR time ending on the last session ("1M / 6M /
+# 1Y / 5Y"). Both kinds end on D', the last trading day on or before the
+# reference date, so a weekend or holiday reference date resolves to the
+# session before it instead of coming back empty.
+# --------------------------------------------------------------------------
+_SESSIONS = {
     Period.DAY: 1,
-    Period.WEEK: 7,
+    Period.WEEK: 5,
+}
+
+_CALENDAR_DAYS = {
     Period.MONTH: 30,
     Period.HALF_YEAR: 182,
     Period.YEAR: 365,
     Period.FIVE_YEAR: 5 * 365 + 2,
 }
 
-# Smallest standard Yahoo range that covers each daily-bar window (Yahoo
-# only accepts 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max). The frame is then
-# sliced to the exact look-back locally.
-_DAILY_YAHOO_RANGE = {
-    Period.WEEK: "1mo",
-    Period.MONTH: "3mo",
-    Period.HALF_YEAR: "1y",
-    Period.YEAR: "2y",
-    Period.FIVE_YEAR: "5y",
+# Calendar days the window nominally spans (a session-counted period's
+# sessions fit in this many days when there are no holidays); used to size
+# the upstream call and to check intraday retention.
+_NOMINAL_SPAN_DAYS = {
+    Period.DAY: 1,
+    Period.WEEK: 7,
+    **_CALENDAR_DAYS,
 }
 
+# D' is found by looking at the bars Yahoo returns, so the call reaches this
+# many days further back than the nominal span. 14 days covers every known
+# exchange closure (long weekend + holiday, Golden Week, the 2001 NYSE
+# closure) and lets a WEEK that straddles holidays still find 5 sessions.
+RESOLUTION_LOOKBACK_DAYS = 14
+
 HOURLY_INTERVAL = "60m"
-PRIMARY_HOURLY_PERIOD = "2d"
-FALLBACK_PERIOD = "5d"
-SESSION_INTERVAL = "5m"
 DAILY_INTERVAL = "1d"
 
 # Yahoo keeps hourly bars for ~730 days only (yfinance encodes the same
-# limit), so a DAY window ending earlier than that can never be served and
-# is rejected (422) before any upstream call.
+# limit). A DAY window starting earlier than that can never be served, so
+# it is rejected (422) before any upstream call; the resolution look-back
+# is clamped to the horizon because Yahoo rejects a `start` beyond it
+# outright.
 HOURLY_RETENTION_DAYS = 730
 
 # `referenceDate` accepts a comma-separated list; each date is one upstream
@@ -136,24 +166,17 @@ def _upstream(fetch_fn: Callable[[], object]):
         raise HTTPException(status_code=502, detail=f"Upstream data error: {exc}") from exc
 
 
-def _fetch_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """One chart call for a Yahoo range (e.g. "5y"), charged to the limiter.
+def _fetch_window(ticker: str, first_day: date, day_after_last: date, interval: str) -> pd.DataFrame:
+    """One chart call for an explicit date window, charged to the limiter.
+    yfinance treats naive dates as midnight in the exchange's time zone,
+    `start` inclusive and `end` exclusive, so the call returns exactly the
+    calendar days [first_day, day_after_last).
 
     Dotted symbols: Yahoo uses dots for exchange suffixes (SAP.DE, 0700.HK,
     BARC.L) - those work as-is - but expects a DASH for US share classes
     (BRK-B), which most people type with a dot (BRK.B). If a dotted symbol
     returns nothing, retry once with dots replaced by dashes; the retry is
-    a second, separately charged upstream call.
-    """
-    return _fetch_chart(ticker, period=period, interval=interval)
-
-
-def _fetch_window(ticker: str, first_day: date, day_after_last: date, interval: str) -> pd.DataFrame:
-    """One chart call for an explicit date window, charged to the limiter.
-    yfinance treats naive dates as midnight in the exchange's time zone,
-    `start` inclusive and `end` exclusive, so the call returns exactly the
-    calendar days [first_day, day_after_last). Same dotted-symbol retry as
-    `_fetch_history`."""
+    a second, separately charged upstream call."""
     return _fetch_chart(ticker, start=first_day, end=day_after_last, interval=interval)
 
 
@@ -196,138 +219,281 @@ def _yahoo_symbol(df: pd.DataFrame, ticker: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Source frames (each = one chart call per request)
-#
-#   hourly   2d @ 60m  (fallback 5d)   -> /historic DAY
-#   session  1d @ 5m   (fallback 5d)   -> /highlow DAY
-#   week     5d @ 60m                  -> /highlow WEEK
-#   daily    <range> @ 1d              -> /historic and /highlow, daily periods
-#
-# Yahoo's chart endpoint accepts ONE symbol per request and retains
-# intraday bars for a limited time only (~60 days for sub-hourly, 730 days
-# for hourly), so daily bars are the only option for the longer windows.
+# Window resolution (shared by both endpoints)
 # --------------------------------------------------------------------------
-def _fetch_hourly_frame(ticker: str) -> pd.DataFrame:
-    """Hourly bars covering at least the last 24h. A 2-day window is used
-    (not 1d) so a full 24h is available right after the open; if it is
-    empty (weekend/holiday) fall back to 5d - a second, separately
-    charged upstream call."""
-    df = _fetch_history(ticker, PRIMARY_HOURLY_PERIOD, HOURLY_INTERVAL)
+class Window(NamedTuple):
+    """Exchange-local calendar dates the served bars span, both inclusive.
+    For session-counted periods `start` is the first session's date; for
+    calendar periods it is `end - (N - 1)` whether or not it traded."""
+
+    start: date
+    end: date  # D': the last trading day on or before the reference date
+
+    def as_json(self) -> dict:
+        return {"start": self.start.isoformat(), "end": self.end.isoformat()}
+
+
+class Loaded(NamedTuple):
+    """The bars of one resolved window plus what the response reports."""
+
+    df: pd.DataFrame  # empty if nothing traded on or before the reference date
+    window: Optional[Window]
+    reference_date: date  # what was asked, or the exchange-local today
+    symbol: str  # the symbol Yahoo answered for
+
+
+def _today_utc() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _today_local(tz) -> date:
+    """Today's calendar date in the exchange's time zone."""
+    return pd.Timestamp.now(tz=tz).date()
+
+
+def _local_dates(df: pd.DataFrame) -> np.ndarray:
+    """Exchange-local calendar date of every bar (the index is tz-aware in
+    the exchange's zone, as yfinance returns it)."""
+    return np.array(df.index.date, dtype=object)
+
+
+def _resolve_window(df: pd.DataFrame, period: Period, reference_date: date):
+    """Apply the window rule to a frame fetched with enough look-back:
+    D' = last bar date on or before `reference_date`, then the period's
+    sessions or calendar days ending on D'. Returns (bars, Window), or
+    (empty frame, None) if nothing traded on or before the date."""
     if df.empty:
-        df = _fetch_history(ticker, FALLBACK_PERIOD, HOURLY_INTERVAL)
-    return df
+        return df, None
+    dates = _local_dates(df)
+    on_or_before = dates[dates <= reference_date]
+    if len(on_or_before) == 0:
+        return _empty_chart(), None
+    end = on_or_before.max()
+    if period in _SESSIONS:
+        sessions = sorted(set(on_or_before))[-_SESSIONS[period] :]
+        start = sessions[0]
+    else:
+        start = end - timedelta(days=_CALENDAR_DAYS[period] - 1)
+    return df[(dates >= start) & (dates <= end)], Window(start, end)
 
 
-def _fetch_last_session_frame(ticker: str) -> pd.DataFrame:
-    """5-minute bars for the most recent trading session. Yahoo's range=1d
-    normally returns the last session even on weekends; if it is empty,
-    fall back to 5d and keep only the latest session's bars."""
-    df = _fetch_history(ticker, "1d", SESSION_INTERVAL)
-    if df.empty:
-        df = _fetch_history(ticker, FALLBACK_PERIOD, SESSION_INTERVAL)
-        if not df.empty:
-            last_session_date = df.index[-1].date()
-            df = df[[ts.date() == last_session_date for ts in df.index]]
-    return df
+def _load_window(
+    ticker: str, period: Period, reference_date: Optional[date], interval: str, retention_days: Optional[int]
+) -> Loaded:
+    """One upstream call for the bars of `period`'s window ending on the
+    last session on or before `reference_date` (None = today). The call
+    covers the nominal span plus the resolution look-back, clamped to
+    Yahoo's retention for the bar size; D' and the exact window are then
+    taken from the bars themselves."""
+    today = _today_utc()
+    # Rolling: "today" in the exchange's zone is not known before the call
+    # (exchanges east of UTC are on tomorrow for part of every UTC day), so
+    # ask up to UTC tomorrow and take the newest bar as D'.
+    asked = reference_date if reference_date is not None else today + timedelta(days=1)
+    first_day = asked - timedelta(days=_NOMINAL_SPAN_DAYS[period] - 1 + RESOLUTION_LOOKBACK_DAYS)
+    if retention_days is not None:
+        first_day = max(first_day, today - timedelta(days=retention_days))
+    df = _upstream(lambda: _fetch_window(ticker, first_day, asked + timedelta(days=1), interval))
+    bars, window = _resolve_window(df, period, asked)
+    if reference_date is None:
+        reference_date = _today_local(df.index.tz) if not df.empty else today
+    return Loaded(bars, window, reference_date, _yahoo_symbol(df, ticker))
 
 
-def _fetch_week_intraday_frame(ticker: str) -> pd.DataFrame:
-    return _fetch_history(ticker, FALLBACK_PERIOD, HOURLY_INTERVAL)
+# --------------------------------------------------------------------------
+# referenceDate parsing and validation (before any upstream call)
+# --------------------------------------------------------------------------
+def _parse_reference_dates(raw: str) -> List[date]:
+    """Parse the `referenceDate` query value: 1..MAX_REFERENCE_DATES
+    comma-separated YYYY-MM-DD dates, whitespace tolerated, no duplicates.
+    Every problem is a 422 naming the offending item, raised before any
+    upstream call is made."""
+    items = [item.strip() for item in raw.split(",")]
+    if len(items) > MAX_REFERENCE_DATES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"referenceDate accepts at most {MAX_REFERENCE_DATES} dates, got {len(items)}.",
+        )
+    dates: List[date] = []
+    for item in items:
+        if not item:
+            raise HTTPException(
+                status_code=422,
+                detail="referenceDate contains an empty item; expected comma-separated YYYY-MM-DD dates.",
+            )
+        if not _ISO_DATE.match(item):
+            raise HTTPException(status_code=422, detail=f"referenceDate '{item}' is not a valid YYYY-MM-DD date.")
+        try:
+            parsed = date.fromisoformat(item)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"referenceDate '{item}' is not a valid calendar date.")
+        if parsed in dates:
+            raise HTTPException(status_code=422, detail=f"referenceDate contains '{item}' more than once.")
+        dates.append(parsed)
+    return dates
 
 
-def _fetch_daily_frame(ticker: str, period: Period) -> pd.DataFrame:
-    """Daily bars covering `period`'s look-back, sliced to it exactly."""
-    df = _fetch_history(ticker, _DAILY_YAHOO_RANGE[period], DAILY_INTERVAL)
-    return _slice_lookback(df, _LOOKBACK_DAYS[period])
+class Retention(NamedTuple):
+    """How far back Yahoo keeps the bars a period needs, for the 422 message."""
+
+    days: int
+    bars: str  # e.g. "hourly"
+    alternative: str  # e.g. "a daily period (WEEK, MONTH...)"
 
 
-def _slice_lookback(df: pd.DataFrame, days: int) -> pd.DataFrame:
-    if df.empty:
-        return df
-    cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=days)
-    return df[df.index >= cutoff]
+def _validate_reference_date(reference_date: date, period: Period, retention: Optional[Retention]) -> None:
+    """Reject windows that can never have data BEFORE spending upstream
+    budget: future dates, and windows whose nominal span starts before
+    Yahoo's retention of the bars the period needs (`retention` is None
+    for daily bars, which go back decades)."""
+    today = _today_utc()
+    # Exchanges east of UTC are already on "tomorrow" for part of every UTC
+    # day, so their current local date must still be accepted: allow one
+    # day of slack (no exchange is more than 14h ahead of UTC).
+    if reference_date > today + timedelta(days=1):
+        raise HTTPException(
+            status_code=422,
+            detail=f"referenceDate {reference_date.isoformat()} is in the future (today is {today.isoformat()} UTC).",
+        )
+    if retention is None:
+        return
+    nominal_start = reference_date - timedelta(days=_NOMINAL_SPAN_DAYS[period] - 1)
+    if nominal_start < today - timedelta(days=retention.days):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"referenceDate {reference_date.isoformat()} is too old for period {period.value}: Yahoo Finance "
+                f"keeps {retention.bars} bars for ~{retention.days} days only. Use a more recent referenceDate or "
+                f"{retention.alternative}."
+            ),
+        )
 
 
-def _localize_date(d: date, tz) -> pd.Timestamp:
-    """Midnight of calendar day `d` in the frame's (exchange) time zone."""
-    return pd.Timestamp(d).tz_localize(tz or "UTC")
+# --------------------------------------------------------------------------
+# Request flow
+# --------------------------------------------------------------------------
+class Bars(NamedTuple):
+    """How a period is served: the bar size fetched, the record granularity
+    label reported, and the retention of that bar size (None: daily bars,
+    which go back decades)."""
+
+    interval: str
+    label: str
+    retention: Optional[Retention]
+
+    @property
+    def intraday(self) -> bool:
+        return self.interval != DAILY_INTERVAL
 
 
-def _window_bounds(reference_date: date, days: int) -> Tuple[date, date]:
-    """(first_day, day_after_last) of the `days`-long window that ENDS on
-    `reference_date` inclusive: start inclusive, end exclusive - the
-    convention yfinance uses for start/end."""
-    return reference_date - timedelta(days=days - 1), reference_date + timedelta(days=1)
+def _serve(ticker: str, period: Period, reference_date: Optional[str], bars: Bars, render) -> dict:
+    """Validate every reference date first, load one window per date,
+    render each (None = nothing usable), 404 only if nothing at all was
+    served. Without `referenceDate` the single window ending today is
+    returned flat; with it the response is keyed by date."""
+    ticker = ticker.upper()
+    header = {"ticker": ticker, "symbol": ticker, "period": period.value, "interval": bars.label}
+    retention_days = bars.retention.days if bars.retention else None
+
+    if reference_date is None:
+        loaded = _load_window(ticker, period, None, bars.interval, retention_days)
+        body = render(loaded.df, bars.intraday) if loaded.window is not None else None
+        if body is None:
+            raise HTTPException(status_code=404, detail=f"No price data found for {ticker} over period {period.value}.")
+        header["symbol"] = loaded.symbol
+        return {**header, "referenceDate": loaded.reference_date.isoformat(), "window": loaded.window.as_json(), **body}
+
+    dates = _parse_reference_dates(reference_date)
+    for d in dates:
+        _validate_reference_date(d, period, bars.retention)
+
+    results = {}
+    for d in dates:
+        loaded = _load_window(ticker, period, d, bars.interval, retention_days)
+        body = render(loaded.df, bars.intraday) if loaded.window is not None else None
+        if body is not None:
+            header["symbol"] = loaded.symbol
+        results[d.isoformat()] = None if body is None else {"window": loaded.window.as_json(), **body}
+    if all(r is None for r in results.values()):
+        listed = ", ".join(d.isoformat() for d in dates)
+        raise HTTPException(
+            status_code=404,
+            detail=f"No price data found for {ticker} over period {period.value} ending on {listed}.",
+        )
+    return {**header, "results": results}
 
 
-def _slice_window(df: pd.DataFrame, reference_date: date, days: int) -> pd.DataFrame:
-    """Keep only the bars of the `days`-long window ending on
-    `reference_date` (inclusive), measured in calendar days of the
-    exchange's time zone. yfinance already fetches exactly this window; the
-    local slice just guarantees the contract regardless of upstream quirks
-    and makes DAY one local trading date, not 24 absolute hours."""
-    if df.empty:
-        return df
-    first_day, day_after = _window_bounds(reference_date, days)
-    tz = df.index.tz
-    return df[(df.index >= _localize_date(first_day, tz)) & (df.index < _localize_date(day_after, tz))]
+_REFERENCE_DATE_QUERY = Query(
+    None,
+    alias="referenceDate",
+    description=(
+        "Optional end date(s) of the window, YYYY-MM-DD: one date (2026-10-23) or up to "
+        f"{MAX_REFERENCE_DATES} unique dates separated by commas (2026-10-23,2026-10-16). The window ends on the "
+        "last trading day on or before each date instead of today, and the response is keyed by date. Dates must "
+        "not be in the future; periods served from intraday bars must be within Yahoo's retention (see the "
+        "endpoint description)."
+    ),
+)
 
 
 # --------------------------------------------------------------------------
 # Downsampling / serialisation helpers
 # --------------------------------------------------------------------------
-def _last_per_bin(df: pd.DataFrame, bin_days: int) -> pd.DataFrame:
-    """Keep the last (most recent) bar of each `bin_days`-wide bin, with
-    bins anchored at the newest bar so the latest record is always the
-    most recent close. Used for fortnightly (14-day) records."""
+_OHLC_COLUMNS = ["Open", "High", "Low", "Close"]
+
+
+def _aggregate_bins(df: pd.DataFrame, bin_ids: np.ndarray) -> pd.DataFrame:
+    """One OHLC bar per bin: first Open, max High, min Low, last Close,
+    stamped with the last bar of the bin (so the record's datetime is the
+    last trading day in it). NaNs are skipped within a bin."""
+    groups = df.groupby(bin_ids, sort=False)
+    out = groups[_OHLC_COLUMNS].agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+    out.index = pd.DatetimeIndex([df.index[groups.indices[key][-1]] for key in out.index], name=df.index.name)
+    return out.sort_index()
+
+
+def _fortnightly(df: pd.DataFrame, bin_days: int = 14) -> pd.DataFrame:
+    """One record per `bin_days`-wide bin, bins anchored at the newest bar
+    so the latest record always ends on the window's last close."""
     if df.empty:
         return df
-    end = df.index[-1]
-    age_days = (end - df.index).days
-    bin_ids = pd.Series(age_days // bin_days, index=df.index)
-    keep = ~bin_ids.duplicated(keep="last")
-    return df[keep.values]
+    # age in exchange-local calendar days (timestamp arithmetic would be
+    # off by one across a DST change: local midnights are 23/25h apart)
+    dates = _local_dates(df)
+    age_days = np.array([(dates[-1] - d).days for d in dates])
+    return _aggregate_bins(df, age_days // bin_days)
 
 
-def _last_per_calendar_month(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep the last bar of each calendar month (month-end close, or the
-    latest bar for the current month)."""
+def _monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """One record per calendar month (the current month's is partial)."""
     if df.empty:
         return df
-    month_keys = pd.Series(df.index.strftime("%Y-%m"), index=df.index)
-    keep = ~month_keys.duplicated(keep="last")
-    return df[keep.values]
+    return _aggregate_bins(df, df.index.strftime("%Y-%m").to_numpy())
 
 
-def _last_24h(df: pd.DataFrame) -> pd.DataFrame:
-    """Rolling 24h window; if the market has been closed longer than that
-    (long weekend) return the most recent 24 bars instead of nothing."""
-    if df.empty:
-        return df
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    windowed = df[df.index >= cutoff]
-    return windowed if not windowed.empty else df.tail(24)
+def _number(value) -> Optional[float]:
+    return None if pd.isna(value) else round(float(value), 4)
 
 
-def _to_points(df: pd.DataFrame, intraday: bool) -> List[dict]:
-    """[{datetime, price}] using the Close of each bar. Intraday bars carry
-    a real time -> full ISO-8601 with exchange UTC offset; daily-or-coarser
-    bars only know the date -> YYYY-MM-DD. NaN closes are skipped."""
-    points = []
-    for ts, close in df["Close"].items():
-        if pd.isna(close):
+def _to_records(df: pd.DataFrame, intraday: bool) -> List[dict]:
+    """[{datetime, open, high, low, close}] per bar. Intraday bars carry a
+    real time -> full ISO-8601 with exchange UTC offset; daily-or-coarser
+    bars only know the date -> YYYY-MM-DD. Bars without a Close are
+    skipped; a missing Open/High/Low is null."""
+    records = []
+    for ts, row in df[_OHLC_COLUMNS].iterrows():
+        if pd.isna(row["Close"]):
             continue
-        points.append(
+        records.append(
             {
                 "datetime": ts.isoformat() if intraday else ts.date().isoformat(),
-                "price": round(float(close), 4),
+                "open": _number(row["Open"]),
+                "high": _number(row["High"]),
+                "low": _number(row["Low"]),
+                "close": _number(row["Close"]),
             }
         )
-    return points
-
-
-def _format_occurrence(ts: pd.Timestamp, intraday: bool) -> str:
-    return ts.isoformat() if intraday else ts.date().isoformat()
+    return records
 
 
 # ==========================================================================
@@ -409,300 +575,106 @@ def get_stock_snapshot(ticker: str):
 # ==========================================================================
 # GET /stock/{symbol}/historic
 # ==========================================================================
-# period -> (record granularity label, downsampler)
-_HISTORIC_SPEC = {
-    Period.WEEK: ("1d", None),
-    Period.MONTH: ("1d", None),
-    Period.HALF_YEAR: ("2wk", lambda df: _last_per_bin(df, 14)),
-    Period.YEAR: ("2wk", lambda df: _last_per_bin(df, 14)),
-    Period.FIVE_YEAR: ("1mo", _last_per_calendar_month),
+_HOURLY_RETENTION = Retention(HOURLY_RETENTION_DAYS, "hourly", "a daily period (WEEK, MONTH...)")
+
+# period -> bars fetched and record granularity reported
+_BARS = {
+    Period.DAY: Bars(HOURLY_INTERVAL, "1h", _HOURLY_RETENTION),
+    Period.WEEK: Bars(DAILY_INTERVAL, "1d", None),
+    Period.MONTH: Bars(DAILY_INTERVAL, "1d", None),
+    Period.HALF_YEAR: Bars(DAILY_INTERVAL, "2wk", None),
+    Period.YEAR: Bars(DAILY_INTERVAL, "2wk", None),
+    Period.FIVE_YEAR: Bars(DAILY_INTERVAL, "1mo", None),
 }
 
-
-def _historic_points(ticker: str, period: Period) -> Tuple[List[dict], str, str]:
-    """Return (points, interval_label, yahoo_symbol) for the rolling window
-    ending now."""
-    if period == Period.DAY:
-        df = _upstream(lambda: _fetch_hourly_frame(ticker))
-        return _to_points(_last_24h(df), intraday=True), "1h", _yahoo_symbol(df, ticker)
-
-    interval_label, downsample = _HISTORIC_SPEC[period]
-    df = _upstream(lambda: _fetch_daily_frame(ticker, period))
-    if downsample is not None and not df.empty:
-        df = downsample(df)
-    return _to_points(df, intraday=False), interval_label, _yahoo_symbol(df, ticker)
-
-
-def _historic_points_ending_on(ticker: str, period: Period, reference_date: date) -> Tuple[List[dict], str, str]:
-    """Return (points, interval_label, yahoo_symbol) for the window of
-    `period`'s length that ENDS on `reference_date` (inclusive): one chart
-    call for exactly that window - hourly bars for DAY, daily bars
-    otherwise - then the same downsampling as the rolling window."""
-    days = _LOOKBACK_DAYS[period]
-    first_day, day_after = _window_bounds(reference_date, days)
-    if period == Period.DAY:
-        df = _upstream(lambda: _fetch_window(ticker, first_day, day_after, HOURLY_INTERVAL))
-        return _to_points(_slice_window(df, reference_date, days), intraday=True), "1h", _yahoo_symbol(df, ticker)
-
-    interval_label, downsample = _HISTORIC_SPEC[period]
-    df = _upstream(lambda: _fetch_window(ticker, first_day, day_after, DAILY_INTERVAL))
-    df = _slice_window(df, reference_date, days)
-    if downsample is not None and not df.empty:
-        df = downsample(df)
-    return _to_points(df, intraday=False), interval_label, _yahoo_symbol(df, ticker)
-
-
-def _today_utc() -> date:
-    return datetime.now(timezone.utc).date()
-
-
-def _parse_reference_dates(raw: str) -> List[date]:
-    """Parse the `referenceDate` query value: 1..MAX_REFERENCE_DATES
-    comma-separated YYYY-MM-DD dates, whitespace tolerated, no duplicates.
-    Every problem is a 422 naming the offending item, raised before any
-    upstream call is made."""
-    items = [item.strip() for item in raw.split(",")]
-    if len(items) > MAX_REFERENCE_DATES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"referenceDate accepts at most {MAX_REFERENCE_DATES} dates, got {len(items)}.",
-        )
-    dates: List[date] = []
-    for item in items:
-        if not item:
-            raise HTTPException(
-                status_code=422,
-                detail="referenceDate contains an empty item; expected comma-separated YYYY-MM-DD dates.",
-            )
-        if not _ISO_DATE.match(item):
-            raise HTTPException(status_code=422, detail=f"referenceDate '{item}' is not a valid YYYY-MM-DD date.")
-        try:
-            parsed = date.fromisoformat(item)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"referenceDate '{item}' is not a valid calendar date.")
-        if parsed in dates:
-            raise HTTPException(status_code=422, detail=f"referenceDate contains '{item}' more than once.")
-        dates.append(parsed)
-    return dates
-
-
-def _validate_reference_date(reference_date: date, period: Period) -> None:
-    """Reject windows that can never have data BEFORE spending upstream
-    budget: future dates, and DAY windows older than Yahoo's hourly
-    retention."""
-    today = _today_utc()
-    # Exchanges east of UTC are already on "tomorrow" for part of every UTC
-    # day, so their current local date must still be accepted: allow one
-    # day of slack (no exchange is more than 14h ahead of UTC).
-    if reference_date > today + timedelta(days=1):
-        raise HTTPException(
-            status_code=422,
-            detail=f"referenceDate {reference_date.isoformat()} is in the future (today is {today.isoformat()} UTC).",
-        )
-    if period == Period.DAY and reference_date < today - timedelta(days=HOURLY_RETENTION_DAYS):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"referenceDate {reference_date.isoformat()} is too old for period DAY: Yahoo Finance keeps hourly "
-                f"bars for ~{HOURLY_RETENTION_DAYS} days only. Use a more recent referenceDate or a daily period "
-                "(WEEK, MONTH...)."
-            ),
-        )
+# period -> downsampler applied to the window's daily bars
+_DOWNSAMPLE = {
+    Period.HALF_YEAR: _fortnightly,
+    Period.YEAR: _fortnightly,
+    Period.FIVE_YEAR: _monthly,
+}
 
 
 @router.get("/{ticker}/historic")
 def get_historic_prices(
     ticker: str,
     period: Period = Query(Period.DAY, description="Look-back window. Case-insensitive. Default DAY."),
-    reference_date: Optional[str] = Query(
-        None,
-        alias="referenceDate",
-        description=(
-            "Optional end date(s) of the window, YYYY-MM-DD, inclusive: one date (2026-10-23) or up to "
-            f"{MAX_REFERENCE_DATES} unique dates separated by commas (2026-10-23,2026-10-16). The window is the "
-            "length of `period` ENDING on each date (exchange-local calendar days) instead of ending now, and the "
-            "response is keyed by date. Dates must not be in the future; for DAY they must be within Yahoo's "
-            "~730-day hourly retention."
-        ),
-    ),
+    reference_date: Optional[str] = _REFERENCE_DATE_QUERY,
 ):
-    """Price series for `ticker` over the chosen period.
+    """OHLC price series for `ticker` over the chosen period.
 
-    | period    | window        | one record per            | `datetime` format          |
-    |-----------|---------------|---------------------------|----------------------------|
-    | DAY       | last 24 hours | hour (hourly bar)         | ISO-8601 w/ exchange offset|
-    | WEEK      | last 7 days   | trading day               | YYYY-MM-DD                 |
-    | MONTH     | last 30 days  | trading day               | YYYY-MM-DD                 |
-    | HALF_YEAR | last 6 months | fortnight (14-day bin)    | YYYY-MM-DD                 |
-    | YEAR      | last 12 months| fortnight (14-day bin)    | YYYY-MM-DD                 |
-    | FIVE_YEAR | last 5 years  | calendar month            | YYYY-MM-DD                 |
+    The window ends on D', the last trading day on or before
+    `referenceDate` (default: today):
 
-    Response (rolling window)::
-
-        {
-          "ticker": "AAPL",
-          "symbol": "AAPL",
-          "period": "DAY",
-          "interval": "1h",
-          "count": 7,
-          "data": [ {"datetime": "2024-05-01T09:30:00-04:00", "price": 172.34}, ... ]
-        }
-
-    With `referenceDate=YYYY-MM-DD[,YYYY-MM-DD...]` (up to 5 unique dates)
-    the same window length ENDS on each date (inclusive) instead of now:
-    DAY -> that trading date's hourly bars, WEEK -> the 7 calendar days up
-    to and including it, and so on. Window bounds are calendar days in
-    the exchange's time zone. The response is then keyed by date, in the
-    order given::
-
-        {
-          "ticker": "BRK.B",
-          "symbol": "BRK-B",
-          "period": "WEEK",
-          "interval": "1d",
-          "results": {
-            "2024-05-07": {"count": 5, "data": [ {"datetime": "2024-05-01", "price": 172.34}, ... ]},
-            "2024-04-30": {"count": 5, "data": [ ... ]}
-          }
-        }
-
-    A date with no bars (market closed) is reported as `count: 0,
-    data: []`; the request is 404 only if every date is empty.
-
-    `ticker` echoes the request; `symbol` is the symbol Yahoo actually
-    answered for - they differ only for US share classes typed with a dot
-    (BRK.B -> BRK-B), which are retried in Yahoo's dash form when the
-    dotted form is unknown (same rule as the snapshot endpoint).
-
-    * `price` is the bar's Close. For fortnight/month records it is the
-      close of the last trading day in that bin, and `datetime` is that
-      day; bins are anchored at the newest bar so the final record is
-      always the latest close (of the window).
-    * DAY without referenceDate: if the market has been closed for more
-      than 24h (long weekend) the most recent 24 hourly bars are returned
-      instead of an empty list. With referenceDate, a date the market was
-      closed is simply 404 (there is nothing to show for that day).
-    * Upstream cost: one live chart call per request, or one per reference
-      date (DAY may need a second one on a long weekend; dotted symbols may
-      be retried once). Nothing is cached. Invalid input (malformed or
-      duplicate dates, more than 5, future dates, DAY beyond retention) is
-      rejected with 422 before any upstream call.
-    """
-    ticker = ticker.upper()
-    if reference_date is None:
-        points, interval_label, yahoo_symbol = _historic_points(ticker, period)
-        if not points:
-            raise HTTPException(
-                status_code=404, detail=f"No price data found for {ticker} over period {period.value}."
-            )
-        return {
-            "ticker": ticker,
-            "symbol": yahoo_symbol,
-            "period": period.value,
-            "interval": interval_label,
-            "count": len(points),
-            "data": points,
-        }
-
-    dates = _parse_reference_dates(reference_date)
-    for d in dates:
-        _validate_reference_date(d, period)
-
-    results = {}
-    yahoo_symbol = ticker
-    interval_label = ""
-    for d in dates:
-        points, interval_label, symbol_used = _historic_points_ending_on(ticker, period, d)
-        if points:
-            yahoo_symbol = symbol_used
-        results[d.isoformat()] = {"count": len(points), "data": points}
-    if not any(r["count"] for r in results.values()):
-        listed = ", ".join(d.isoformat() for d in dates)
-        raise HTTPException(
-            status_code=404,
-            detail=f"No price data found for {ticker} over period {period.value} ending on {listed}.",
-        )
-    return {
-        "ticker": ticker,
-        "symbol": yahoo_symbol,
-        "period": period.value,
-        "interval": interval_label,
-        "results": results,
-    }
-
-
-# ==========================================================================
-# GET /stock/{symbol}/highlow
-# ==========================================================================
-def _load_highlow_frame(ticker: str, period: Period) -> Tuple[pd.DataFrame, bool]:
-    """(frame, is_intraday) with the bars needed for `period`."""
-    if period == Period.DAY:
-        return _upstream(lambda: _fetch_last_session_frame(ticker)), True
-    if period == Period.WEEK:
-        return _upstream(lambda: _fetch_week_intraday_frame(ticker)), True
-    return _upstream(lambda: _fetch_daily_frame(ticker, period)), False
-
-
-def _compute_extremes(df: pd.DataFrame) -> Optional[dict]:
-    """Max of High and min of Low with the bar timestamp each occurred in.
-    NaN bars are ignored. None if there is nothing usable."""
-    if df.empty or "High" not in df.columns or "Low" not in df.columns:
-        return None
-    highs = df["High"].dropna()
-    lows = df["Low"].dropna()
-    if highs.empty or lows.empty:
-        return None
-    high_ts = highs.idxmax()
-    low_ts = lows.idxmin()
-    return {
-        "high": round(float(highs.loc[high_ts]), 4),
-        "high_ts": high_ts,
-        "low": round(float(lows.loc[low_ts]), 4),
-        "low_ts": low_ts,
-    }
-
-
-@router.get("/{ticker}/highlow")
-def get_high_low(
-    ticker: str,
-    period: Period = Query(Period.WEEK, description="Look-back window. Case-insensitive. Default WEEK."),
-):
-    """Highest and lowest traded price for `ticker` over the chosen period,
-    with when each occurred.
+    | period    | window                          | one record per         | `datetime` format           |
+    |-----------|---------------------------------|------------------------|-----------------------------|
+    | DAY       | the session on D'               | hour (hourly bar)      | ISO-8601 w/ exchange offset |
+    | WEEK      | the 5 sessions ending on D'     | trading day            | YYYY-MM-DD                  |
+    | MONTH     | 30 calendar days ending on D'   | trading day            | YYYY-MM-DD                  |
+    | HALF_YEAR | 182 calendar days ending on D'  | fortnight (14-day bin) | YYYY-MM-DD                  |
+    | YEAR      | 365 calendar days ending on D'  | fortnight (14-day bin) | YYYY-MM-DD                  |
+    | FIVE_YEAR | 5 years ending on D'            | calendar month         | YYYY-MM-DD                  |
 
     Response::
 
         {
+          "ticker": "AAPL",
           "symbol": "AAPL",
           "period": "WEEK",
-          "high": 195.12,
-          "highOccured": "2024-05-01T10:00:00-04:00",
-          "low": 188.4,
-          "lowOccured": "2024-04-29T15:00:00-04:00"
+          "interval": "1d",
+          "referenceDate": "2026-10-25",
+          "window": {"start": "2026-10-19", "end": "2026-10-23"},
+          "count": 5,
+          "data": [
+            {"datetime": "2026-10-19", "open": 171.9, "high": 173.2, "low": 171.4, "close": 172.34},
+            ...
+          ]
         }
 
-    * `high`/`low` are the High/Low of the bar in which they occurred (the
-      true traded extreme, not the close).
-    * `highOccured`/`lowOccured` precision follows the bar size: DAY ->
-      5-minute bar, WEEK -> hourly bar (both ISO-8601 with exchange UTC
-      offset); MONTH/HALF_YEAR/YEAR/FIVE_YEAR -> date (YYYY-MM-DD).
-    * Upstream cost: one live chart call per request (DAY may need a
-      second one on a weekend; dotted symbols may be retried once).
-      Nothing is cached.
+    * Each record is one bar's Open / High / Low / Close, so the window's
+      traded extremes are `max(high)` and `min(low)` over `data`, and the
+      record they sit in says when (to the hour for DAY, to the day
+      otherwise). Fortnight/month records are aggregates of their bin:
+      first open, highest high, lowest low, last close, stamped with the
+      bin's last trading day; bins are anchored at the newest bar so the
+      final record always ends on the window's last close. DAY includes
+      the running hourly bar while the market is open.
+    * `referenceDate` is the date asked for (today when omitted), `window`
+      the exchange-local dates actually served: `end` is D' (a Sunday
+      resolves to the Friday before), `start` the first session of a
+      DAY/WEEK window or `end - 29/181/364 days / 5 years` for the
+      calendar periods.
+    * With `referenceDate=YYYY-MM-DD[,YYYY-MM-DD...]` (up to 5 unique
+      dates) the response is keyed by date, in the order given::
+
+        {
+          "ticker": "BRK.B", "symbol": "BRK-B", "period": "WEEK", "interval": "1d",
+          "results": {
+            "2026-10-25": {"window": {"start": "2026-10-19", "end": "2026-10-23"}, "count": 5, "data": [...]},
+            "2010-01-01": null
+          }
+        }
+
+      An entry is `null` only when nothing traded on or before that date
+      (before the listing); the request is 404 only if every entry is
+      null.
+    * `ticker` echoes the request; `symbol` is the symbol Yahoo actually
+      answered for - they differ only for US share classes typed with a
+      dot (BRK.B -> BRK-B), which are retried in Yahoo's dash form.
+    * Upstream cost: one live chart call per window (dotted symbols may
+      be retried once). Nothing is cached. Invalid input (malformed or
+      duplicate dates, more than 5, future dates, DAY older than Yahoo's
+      ~730-day hourly retention) is rejected with 422 before any call.
     """
-    ticker = ticker.upper()
-    df, intraday = _load_highlow_frame(ticker, period)
-    extremes = _compute_extremes(df)
-    if extremes is None:
-        raise HTTPException(status_code=404, detail=f"No price data found for {ticker} over period {period.value}.")
-    return {
-        "symbol": ticker,
-        "period": period.value,
-        "high": extremes["high"],
-        "highOccured": _format_occurrence(extremes["high_ts"], intraday),
-        "low": extremes["low"],
-        "lowOccured": _format_occurrence(extremes["low_ts"], intraday),
-    }
+    downsample = _DOWNSAMPLE.get(period)
+
+    def render(df: pd.DataFrame, intraday: bool) -> Optional[dict]:
+        if downsample is not None and not df.empty:
+            df = downsample(df)
+        records = _to_records(df, intraday)
+        return {"count": len(records), "data": records} if records else None
+
+    return _serve(ticker, period, reference_date, _BARS[period], render)
 
 
 # ==========================================================================

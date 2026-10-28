@@ -2,22 +2,29 @@
 Shared fixtures.
 
 yfinance is patched at the `stock_router.yf.Ticker` seam with a fake that
-returns DataFrames shaped exactly like the real library does:
+answers `history(start=, end=, interval=)` from a synthetic exchange
+(`FakeMarket`) whose frames are shaped exactly like the real library's:
 
-* tz-aware DatetimeIndex named "Date" (interval >= 1d) or "Datetime"
-  (intraday), as set in yfinance/scrapers/history.py
+* tz-aware DatetimeIndex named "Date" (daily) or "Datetime" (intraday) in
+  the exchange's zone, as set in yfinance/scrapers/history.py
 * columns Open/High/Low/Close (float64), Volume (int64), Dividends,
-  Stock Splits (float64), optionally Capital Gains
-* may contain NaN, as real Yahoo data does
+  Stock Splits (float64)
+* intraday bars anchored on the session open (09:30, 10:30, ... like
+  Yahoo's hourly bars), daily bars stamped at local midnight
+* `[start, end)` with bare dates taken as exchange-local midnight
 
-This lets the full FastAPI request/response path (including JSON
-rendering, which is where the NaN bug lived) run without network access.
+The market has weekday sessions minus a known set of holidays, and a
+clock (`FakeMarket.now`) that decides which bars "exist yet": the daily
+bar for today appears together with the first intraday bar, as on Yahoo.
+Both bar sizes are derived from one session list and one price path,
+so hourly and daily bars agree exactly.
 """
 
 import sys
-from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,42 +37,26 @@ import stock_router  # noqa: E402
 from main import app  # noqa: E402
 
 EXCHANGE_TZ = "America/New_York"
+SESSION_OPEN = time(9, 30)
+SESSION_CLOSE = time(16, 0)
+TODAY = date.today()
 
 
-def make_ohlc_frame(
-    *,
-    periods: int,
-    freq: str,
-    end: Optional[pd.Timestamp] = None,
-    intraday: bool = True,
-    start_price: float = 100.0,
-    with_nan_row: bool = False,
-    extra_columns: Optional[dict] = None,
-) -> pd.DataFrame:
-    """Build a yfinance-shaped OHLC frame ending at `end` (default: now)."""
-    if end is None:
-        end = pd.Timestamp.now(tz=EXCHANGE_TZ).floor("h")
-    idx = pd.date_range(end=end, periods=periods, freq=freq, tz=EXCHANGE_TZ)
-    idx.name = "Datetime" if intraday else "Date"
-    close = np.linspace(start_price, start_price + periods - 1, periods)
-    df = pd.DataFrame(
-        {
-            "Open": close - 0.5,
-            "High": close + 1.0,
-            "Low": close - 1.0,
-            "Close": close,
-            "Volume": np.arange(1000, 1000 + periods, dtype=np.int64),
-            "Dividends": np.zeros(periods),
-            "Stock Splits": np.zeros(periods),
-        },
-        index=idx,
-    )
-    if extra_columns:
-        for name, value in extra_columns.items():
-            df[name] = value
-    if with_nan_row:
-        df.iloc[-1, df.columns.get_loc("Open")] = np.nan
-    return df
+def _weekday_on_or_before(d: date, weekday: int) -> date:
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+# Holidays of the default market, placed relative to today so the tests
+# are stable whatever the calendar says:
+#   * HOLIDAY: a Wednesday 3-4 weeks back (inside every intraday retention)
+#   * CLOSURE: a 9-calendar-day shutdown (Golden-Week style: Sat..Sun
+#     around a full week) ending ~300 days back
+HOLIDAY = _weekday_on_or_before(TODAY - timedelta(days=21), 2)
+CLOSURE_END = _weekday_on_or_before(TODAY - timedelta(days=300), 6)  # a Sunday
+CLOSURE_START = CLOSURE_END - timedelta(days=8)  # the Saturday before the previous week
+DEFAULT_HOLIDAYS = frozenset(
+    {HOLIDAY} | {CLOSURE_START + timedelta(days=n) for n in range(9) if (CLOSURE_START + timedelta(days=n)).weekday() < 5}
+)
 
 
 def _empty_frame() -> pd.DataFrame:
@@ -77,21 +68,154 @@ def _empty_frame() -> pd.DataFrame:
 def slice_like_yahoo(df: pd.DataFrame, start, end) -> pd.DataFrame:
     """What yfinance returns for history(start=, end=): bars in
     [start, end) with naive dates taken as exchange-local midnight."""
+    if df.empty:
+        return df
     tz = df.index.tz
     lo = pd.Timestamp(start).tz_localize(tz)
     hi = pd.Timestamp(end).tz_localize(tz)
     return df[(df.index >= lo) & (df.index < hi)]
 
 
+class FakeMarket:
+    """A synthetic exchange with mutually consistent daily and hourly bars.
+
+    Every bar is a true aggregation of 5-minute "slots": price rises by
+    0.01 per slot from 100 at the first session, so a bar's Close is the
+    close of its last slot, High = that + 1, Low = first slot's close - 1.
+    Hence the newest bar of any window holds its high and the oldest its
+    low unless a test plants a spike, and a daily bar's High equals the
+    max High of its hourly bars exactly. Hourly bars are anchored on the
+    open like Yahoo's (09:30 ... 15:30, the last one 30 minutes long).
+    Only bars that have started by `now` exist; the daily bar of the
+    running session is partial, as on Yahoo.
+
+    Hourly bars only reach back as far as Yahoo keeps them (plus a
+    margin), daily bars span the whole history.
+    """
+
+    SLOT = pd.Timedelta(minutes=5)
+    SESSION_LENGTH = pd.Timedelta(hours=6, minutes=30)
+
+    def __init__(
+        self,
+        first_session: date,
+        last_session: date,
+        holidays: Iterable[date] = (),
+        now: Optional[pd.Timestamp] = None,
+        tz: str = EXCHANGE_TZ,
+    ):
+        self.tz = tz
+        self.holidays = frozenset(holidays)
+        self.now = now if now is not None else pd.Timestamp.now(tz=tz)
+        all_days = pd.date_range(first_session, last_session, freq="D").date
+        self.sessions: List[date] = [d for d in all_days if d.weekday() < 5 and d not in self.holidays]
+        self._origin = self._open(self.sessions[0])
+        # sessions whose open has passed by `now` (the only ones with bars)
+        self.started: List[date] = [s for s in self.sessions if self._open(s) <= self.now]
+        self.daily = self._bars(self.sessions, "6h30min", "Date")
+        self.hourly = self._bars(self._recent(stock_router.HOURLY_RETENTION_DAYS + 40), "60min", "Datetime")
+
+    # -- construction --------------------------------------------------
+    def _open(self, s: date) -> pd.Timestamp:
+        return pd.Timestamp(datetime.combine(s, SESSION_OPEN)).tz_localize(self.tz)
+
+    def _recent(self, days: int) -> List[date]:
+        cutoff = self.now.date() - timedelta(days=days)
+        return [s for s in self.sessions if s >= cutoff]
+
+    def _bars(self, sessions: List[date], freq: str, name: str) -> pd.DataFrame:
+        if not sessions:
+            return _empty_frame()
+        offsets = pd.timedelta_range(start="0min", end=self.SESSION_LENGTH, freq=freq)
+        offsets = offsets[offsets < self.SESSION_LENGTH]
+        opens_utc = pd.DatetimeIndex([self._open(s) for s in sessions]).tz_convert(None).to_numpy()
+        starts = (opens_utc[:, None] + offsets.to_numpy()[None, :]).ravel()
+        session_close = np.repeat(opens_utc, len(offsets)) + self.SESSION_LENGTH.to_numpy()
+        ends = np.minimum(starts + pd.Timedelta(freq).to_numpy(), session_close)
+        now_utc = self.now.tz_convert(None).to_datetime64()
+        started = starts <= now_utc
+        starts, ends = starts[started], ends[started]
+        # the last slot that has started by now
+        now_slot_end = (self.now.floor("5min") + self.SLOT).tz_convert(None).to_datetime64()
+        last_slot = np.minimum(ends, now_slot_end) - self.SLOT.to_numpy()
+        to_local = lambda arr: pd.DatetimeIndex(arr).tz_localize("UTC").tz_convert(self.tz)  # noqa: E731
+        starts, last_slot = to_local(starts), to_local(last_slot)
+        first_units = ((starts - self._origin) / self.SLOT).astype(float)
+        last_units = ((last_slot - self._origin) / self.SLOT).astype(float)
+        close = 100.0 + 0.01 * last_units
+        first_close = 100.0 + 0.01 * first_units
+        idx = starts.normalize() if name == "Date" else starts
+        idx = pd.DatetimeIndex(idx, name=name)
+        n = len(idx)
+        return pd.DataFrame(
+            {
+                "Open": first_close - 0.5,
+                "High": close + 1.0,
+                "Low": first_close - 1.0,
+                "Close": close,
+                "Volume": np.arange(1000, 1000 + n, dtype=np.int64),
+                "Dividends": np.zeros(n),
+                "Stock Splits": np.zeros(n),
+            },
+            index=idx,
+        )
+
+    # -- queries used by tests -------------------------------------------
+    def frame(self, interval: str) -> pd.DataFrame:
+        return {"60m": self.hourly, "1d": self.daily}[interval]
+
+    def respond(self, start, end, interval) -> pd.DataFrame:
+        """Answer a yfinance history(start=, end=, interval=) call."""
+        return slice_like_yahoo(self.frame(interval), start, end)
+
+    def sessions_on_or_before(self, d: date) -> List[date]:
+        return [s for s in self.started if s <= d]
+
+    def last_session_on_or_before(self, d: date) -> date:
+        return self.sessions_on_or_before(d)[-1]
+
+    def is_session(self, d: date) -> bool:
+        return d.weekday() < 5 and d not in self.holidays
+
+    def bars(self, interval: str, start: date, end: date) -> pd.DataFrame:
+        """Bars of `interval` whose local date is in [start, end]."""
+        df = self.frame(interval)
+        dates = np.array(df.index.date, dtype=object)
+        return df[(dates >= start) & (dates <= end)]
+
+
+@lru_cache(maxsize=None)
+def _build_market(first_session, last_session, holidays, now, tz) -> FakeMarket:
+    return FakeMarket(first_session, last_session, holidays, now, tz)
+
+
+def make_market(**overrides) -> FakeMarket:
+    """The default market: ~21 years of sessions ending today, the
+    holidays above, clock = now. Markets are memoised (building one takes
+    ~0.4s); the frames are copied so tests may plant spikes freely."""
+    params = dict(
+        first_session=TODAY - timedelta(days=21 * 365),
+        last_session=TODAY + timedelta(days=1),
+        holidays=DEFAULT_HOLIDAYS,
+        now=None,
+        tz=EXCHANGE_TZ,
+    )
+    params.update(overrides)
+    if params["now"] is None:
+        params["now"] = pd.Timestamp.now(tz=params["tz"]).floor("min")
+    base = _build_market(**params)
+    m = FakeMarket.__new__(FakeMarket)
+    m.__dict__.update(base.__dict__)
+    m.daily, m.hourly = base.daily.copy(), base.hourly.copy()
+    return m
+
+
 class FakeTicker:
     """Stand-in for yfinance.Ticker.
 
     Configure via class attributes on a per-test basis:
-      * ``responses``: dict mapping (period, interval) -> DataFrame, or a
-        callable(period, interval) -> DataFrame. Missing keys -> empty df.
       * ``window_responses``: callable(start, end, interval) -> DataFrame
-        for ``history(start=, end=)`` calls (the referenceDate path).
-        None -> empty df.
+        for ``history(start=, end=)`` calls. None -> empty df.
       * ``info_payload``: dict returned by ``.info``.
       * ``info_for``: per-symbol override, dict symbol -> info dict
         (symbols absent from it get an empty dict, i.e. "unknown").
@@ -99,7 +223,6 @@ class FakeTicker:
     ``calls`` records every ``.history()`` invocation for assertions.
     """
 
-    responses = {}
     window_responses = None
     info_payload = {}
     info_for = None  # dict symbol -> info dict; None = use info_payload for all
@@ -110,25 +233,12 @@ class FakeTicker:
         self.symbol = symbol
 
     def history(self, period=None, interval="1d", start=None, end=None, **kwargs):
-        if start is not None or end is not None:
-            # Like yfinance: start/end replace the Yahoo range.
-            FakeTicker.calls.append({"symbol": self.symbol, "start": start, "end": end, "interval": interval})
-            if FakeTicker.raise_on_history is not None:
-                raise FakeTicker.raise_on_history
-            if FakeTicker.window_responses is None:
-                return _empty_frame()
-            return FakeTicker.window_responses(start, end, interval)
-        period = period or "1mo"
-        FakeTicker.calls.append({"symbol": self.symbol, "period": period, "interval": interval})
+        FakeTicker.calls.append({"symbol": self.symbol, "start": start, "end": end, "interval": interval})
         if FakeTicker.raise_on_history is not None:
             raise FakeTicker.raise_on_history
-        responses = FakeTicker.responses
-        if callable(responses):
-            return responses(period, interval)
-        df = responses.get((period, interval))
-        if df is None:
+        if FakeTicker.window_responses is None:
             return _empty_frame()
-        return df
+        return FakeTicker.window_responses(start, end, interval)
 
     @property
     def info(self):
@@ -149,7 +259,6 @@ def fake_yfinance(monkeypatch, request):
         yield None
         return
 
-    FakeTicker.responses = {}
     FakeTicker.window_responses = None
     FakeTicker.info_payload = {}
     FakeTicker.info_for = None
@@ -163,6 +272,27 @@ def fake_yfinance(monkeypatch, request):
 
 
 @pytest.fixture
+def market(fake_yfinance) -> FakeMarket:
+    """The default market, wired into the fake yfinance."""
+    m = make_market()
+    fake_yfinance.window_responses = m.respond
+    return m
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Freeze the router's idea of 'today' (UTC) and 'today at the
+    exchange' to a given instant."""
+
+    def freeze(now: pd.Timestamp):
+        monkeypatch.setattr(stock_router, "_today_utc", lambda: now.tz_convert("UTC").date())
+        monkeypatch.setattr(stock_router, "_today_local", lambda tz: now.tz_convert(tz).date())
+        return now
+
+    return freeze
+
+
+@pytest.fixture
 def client():
     return TestClient(app)
 
@@ -170,16 +300,3 @@ def client():
 @pytest.fixture
 def now_utc():
     return datetime.now(timezone.utc)
-
-
-@pytest.fixture
-def hourly_30_bars():
-    """30 consecutive hourly bars ending now -> 24 fall inside the last 24h."""
-    return make_ohlc_frame(periods=30, freq="h", intraday=True)
-
-
-@pytest.fixture
-def stale_hourly_bars():
-    """Hourly bars whose newest bar is 3 days old (e.g. long weekend)."""
-    end = pd.Timestamp.now(tz=EXCHANGE_TZ).floor("h") - timedelta(days=3)
-    return make_ohlc_frame(periods=40, freq="h", end=end, intraday=True)
