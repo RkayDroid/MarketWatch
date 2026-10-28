@@ -128,6 +128,6 @@ def test_openapi_lists_exactly_two_stock_routes():
     assert stock_paths == ["/stock/{ticker}", "/stock/{ticker}/historic"]
 
 
-def test_status_and_time_endpoints(client):
+def test_status_endpoint_and_time_removed(client):
     assert client.get("/status").json()["status"] == "online"
-    assert "UTC" in client.get("/time").json()["current_times"]
+    assert client.get("/time").status_code == 404

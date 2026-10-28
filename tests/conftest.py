@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import stock_router  # noqa: E402
+import stores  # noqa: E402
 from main import app  # noqa: E402
 
 EXCHANGE_TZ = "America/New_York"
@@ -290,6 +291,19 @@ def clock(monkeypatch):
         return now
 
     return freeze
+
+
+@pytest.fixture(autouse=True)
+def empty_stores():
+    """Fresh in-memory stores for every test, with the users the watchlist
+    tests create lists for already registered."""
+    stores.users.clear()
+    stores.watchlists.clear()
+    for user_id in ("u1", "u2"):
+        stores.users.create(user_id)
+    yield stores
+    stores.users.clear()
+    stores.watchlists.clear()
 
 
 @pytest.fixture

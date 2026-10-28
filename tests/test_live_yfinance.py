@@ -103,18 +103,39 @@ def test_live_historic_rolling(client, period):
 
 
 def test_live_aggregated_records_contain_the_daily_extremes(client):
-    """A YEAR's fortnight records must carry the same extremes as the
-    underlying daily bars (served by MONTH windows over the same days)."""
-    year = _strict_json(client.get("/stock/AAPL/historic?period=YEAR").text)
-    end = year["window"]["end"]
-    month = _strict_json(client.get(f"/stock/AAPL/historic?period=MONTH&referenceDate={end}").text)["results"][end]
-    last_bin_start = year["data"][-2]["datetime"]  # the last record covers the days after the previous one
-    daily_in_last_bin = [p for p in month["data"] if p["datetime"] > last_bin_start]
+    """A YEAR's last fortnight record must carry the extremes of the daily
+    bars it aggregates (served by a MONTH window over the same days).
 
-    assert year["data"][-1]["high"] == max(p["high"] for p in daily_in_last_bin)
-    assert year["data"][-1]["low"] == min(p["low"] for p in daily_in_last_bin)
-    assert year["data"][-1]["close"] == daily_in_last_bin[-1]["close"]
-    assert year["data"][-1]["open"] == daily_in_last_bin[0]["open"]
+    Both windows are anchored on the same *past* weekday so neither contains
+    the running session: a rolling YEAR and an anchored MONTH are two live
+    calls, and during market hours Yahoo's bar for today changes between
+    them (high/close tick by tick), which made the rolling version of this
+    test fail whenever it ran while the market was open. The bin is taken
+    from the documented rule - the 14 calendar days ending on D' - not
+    inferred from the previous record's stamp; bars with a null high/low
+    are ignored; prices are compared to the cent since the two windows come
+    from two different upstream range queries."""
+    reference = _recent_weekday(3).isoformat()  # a completed session (D' resolves holidays)
+    year = _strict_json(client.get(f"/stock/AAPL/historic?period=YEAR&referenceDate={reference}").text)
+    year_window = year["results"][reference]
+    end = year_window["window"]["end"]
+    assert end <= reference
+    month = _strict_json(client.get(f"/stock/AAPL/historic?period=MONTH&referenceDate={end}").text)["results"][end]
+    assert month["window"]["end"] == end
+
+    bin_start = (date.fromisoformat(end) - timedelta(days=13)).isoformat()
+    daily_in_last_bin = [p for p in month["data"] if bin_start <= p["datetime"] <= end]
+    assert daily_in_last_bin and daily_in_last_bin[-1]["datetime"] == end
+    highs = [p["high"] for p in daily_in_last_bin if p["high"] is not None]
+    lows = [p["low"] for p in daily_in_last_bin if p["low"] is not None]
+
+    last = year_window["data"][-1]
+    assert last["datetime"] == end
+    cent = lambda expected: pytest.approx(expected, abs=0.01)  # noqa: E731
+    assert last["high"] == cent(max(highs))
+    assert last["low"] == cent(min(lows))
+    assert last["close"] == cent(daily_in_last_bin[-1]["close"])
+    assert last["open"] == cent(daily_in_last_bin[0]["open"])
 
 
 def test_live_each_window_is_one_upstream_call(client):

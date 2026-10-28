@@ -1,8 +1,9 @@
 # Market Watch Lite
 
 A small FastAPI service exposing stock data from Yahoo Finance (via
-[yfinance](https://github.com/ranaroussi/yfinance)). Every API request is
-served by a live yfinance call — **there is no caching in this version**
+[yfinance](https://github.com/ranaroussi/yfinance)), plus **registered
+users** and their **watchlists** (named, ordered lists of symbols), both
+kept in in-memory stores. Every stock request is served by a live yfinance call — **there is no caching in this version**
 (deliberately, until the use cases are settled; see *Upstream request
 budget*). A hard upstream rate limiter keeps the service inside yfinance's
 informal free-tier budget of **~2000 requests/hour**.
@@ -171,11 +172,140 @@ Wednesday 2026‑10‑14 was a holiday, so the 5 sessions span 8 days)
 
 ---
 
+### 3. Users — `POST /user`, `GET /user/{userId}/watchlists`
+
+The lightest possible user management: a user is a **registered id**, no
+authentication or profile. It exists so a watchlist can only be created
+for a user the service knows, and so a user's watchlists can be listed.
+Ids are trimmed and matched **case-insensitively** (`alice` / `Alice` are
+one user); responses echo the spelling used at registration. Neither
+route makes upstream calls.
+
+#### `POST /user` → `201`
+
+```json
+{"userId": "alice"}
+```
+```json
+{"userId": "alice"}
+```
+
+`409` if already registered; `422` for a blank id, one containing
+whitespace or `/`, or longer than 100 characters.
+
+#### `GET /user/{userId}/watchlists`
+
+Ids and names only, oldest first — use `GET /watchlist/{id}` for the live
+view. `404` for an unregistered user.
+
+```json
+{
+  "userId": "alice",
+  "count": 2,
+  "watchlists": [
+    {"watchListId": "k3Zp9QaB", "watchListName": "Tech"},
+    {"watchListId": "Qw8rT2vM", "watchListName": "ETFs"}
+  ]
+}
+```
+
+---
+
+### 4. Watchlists — `POST` / `GET` / `PUT` / `DELETE /watchlist`
+
+A watchlist is a **named, ordered list of symbols owned by a registered
+user** (`POST /user` first; an unknown `userId` is `422` and nothing is
+stored). It lives in an in-memory store (`watchlist_store.py`): process-local, empty
+after a restart — the project's first piece of stored state, put behind a
+small `WatchlistStore` interface so a database can replace it later.
+
+| route | what | upstream cost |
+|---|---|---|
+| `POST /watchlist` | create | 0 |
+| `GET /watchlist/{id}` | the list with a live `/stock/{symbol}` snapshot per position | 2 per symbol |
+| `PUT /watchlist` | rename and/or **replace** the ordered symbols (add / remove / re-order) | 2 per symbol |
+| `DELETE /watchlist/{id}` | delete | 0 |
+
+Rules, applied the same way everywhere:
+
+* symbols are normalised like `/stock/{symbol}` (trimmed, upper-cased),
+  must be unique within a list, and a list holds at most **50** symbols
+  (`MAX_SYMBOLS`; a `GET` costs 2 upstream calls per symbol);
+* symbols are **not** looked up on Yahoo when written (that would spend
+  2 calls per symbol of the hourly budget on every save); an unknown one
+  shows up in `GET` as an `{"ticker", "error"}` entry instead of a snapshot;
+* **a user cannot have two watchlists with the same name** → `409`. The
+  name is compared case-insensitively and trimmed (`Tech`/`tech`), on
+  create and on rename, and `userId` is matched the way `/user` defines
+  it; the rule is an index in the store, so no write path can bypass it. An unknown
+  `watchListId` → `404`; invalid input → `422` — all before any upstream
+  call;
+* `watchListId` is a **short random id** (8 alphanumerics, case-sensitive,
+  e.g. `k3Zp9QaB`) — easy to read and paste into a URL; collisions are
+  checked on allocation;
+* `GET`/`PUT` answer `429` if the hourly budget runs out part-way and
+  `502` on any other upstream failure — for the whole request, as
+  multi-date `/historic` does.
+
+#### `POST /watchlist` → `201`
+
+```json
+{"userId": "alice", "watchListName": "Tech", "symbols": ["aapl", "MSFT", "SAP.DE"]}
+```
+```json
+{"userId": "alice", "watchListName": "Tech", "watchListId": "k3Zp9QaB"}
+```
+
+`symbols` is optional (default `[]`). `userId` must be registered and is
+echoed as registered (`"ALICE"` in the request → `"alice"` in the
+response).
+
+#### `GET /watchlist/{id}`
+
+`symbols` is keyed by **position** (1-based, in the list's order); every
+value is exactly the `/stock/{symbol}` response:
+
+```json
+{
+  "watchListId": "k3Zp9QaB",
+  "userId": "alice",
+  "watchListName": "Tech",
+  "count": 3,
+  "symbols": {
+    "1": {"ticker": "AAPL", "sector": "Technology", "fulldayPrice": 347.725, "currency": "USD", "symbol": "AAPL",
+          "language": "en-US", "longName": "Apple Inc.", "exchange": "NMS", "market": "us_market", "displayName": "Apple"},
+    "2": {"ticker": "MSFT", "...": "..."},
+    "3": {"ticker": "NOPE", "error": "Ticker NOPE not found."}
+  }
+}
+```
+
+#### `PUT /watchlist` → the `GET` view of the new state
+
+Send the new name and/or the **complete** symbol list in the wanted order;
+a field that is left out keeps its current value (at least one must be
+given, else `422`). `symbols` is `{position: symbol}` — taken in position
+order, positions need not be contiguous, the response renumbers them
+1..N — or a plain list. `{}` / `[]` empties the list.
+
+```json
+{"watchListId": "k3Zp9QaB", "watchListName": "Tech & ETFs"}                                      rename only
+{"watchListId": "k3Zp9QaB", "symbols": {"1": "MSFT", "2": "AAPL", "3": "VTI"}}                   symbols only
+{"watchListId": "k3Zp9QaB", "watchListName": "Tech & ETFs", "symbols": ["MSFT", "AAPL", "VTI"]}  both
+```
+
+#### `DELETE /watchlist/{id}` → `200`
+
+```json
+{"watchListId": "k3Zp9QaB", "deleted": true}
+```
+
+---
+
 ### Utility
 
 * `GET /status` — liveness, plus how much of the hourly upstream budget
   is left: `{"status": "online", ..., "upstream_budget": {"per_hour": 1800, "remaining": 1793}}`.
-* `GET /time` — current time in major time zones.
 
 ## Upstream request budget
 
@@ -188,6 +318,8 @@ intraday resolution. What each API call costs:
 |---|---|
 | `/stock/{symbol}` | `quoteSummary` + `quote` (= yfinance `.info`) → **2** |
 | `/historic` | `start/end @ 60m` (DAY) or `@ 1d` → **1 per window** (one per `referenceDate`, ≤ 5) |
+| `GET`/`PUT /watchlist` | one `/stock/{symbol}` snapshot per symbol → **2 per symbol** (≤ 50) |
+| `POST`/`DELETE /watchlist`, `/user` routes | **0** |
 
 Every window is one `start/end` call: the period's nominal span plus a
 14-day look-back (so D′ can be resolved from the bars that come back),
@@ -233,7 +365,7 @@ routes fine. Yahoo's own convention matters more:
 
 ```
 pip install -r requirements-dev.txt
-pytest                                            # 145 offline tests, ~10s
+pytest                                            # 238 offline tests, ~10s
 LIVE_YF=1 pytest tests/test_live_yfinance.py -v   # 24 opt-in tests against real Yahoo
 ```
 
@@ -245,16 +377,25 @@ sizes agree exactly, including the partial running session), shaped like
 the real library's frames (tz-aware `Date`/`Datetime` index, `int64`
 Volume, `Dividends`/`Stock Splits` columns). `test_window_rule.py` covers
 the window rule, `test_historic_endpoint.py` the records (OHLC per bar,
-bin aggregation, NaN handling). The live tests need network access and a
+bin aggregation, NaN handling), `test_watchlist.py` the watchlist CRUD
+(validation, snapshots per position, budget accounting, 404/409/422/429/502)
+and its store, `test_users.py` user registration, the per-user listing
+and the user store. The live tests need network access and a
 handful of real requests.
 
 ## Layout
 
 ```
-main.py            FastAPI app (+ /status, /time)
+main.py            FastAPI app (+ /status)
 stock_router.py    the /stock endpoints and all yfinance access
+user_router.py     POST /user, GET /user/{id}/watchlists
+user_store.py      UserStore interface + InMemoryUserStore (stdlib only)
+watchlist_router.py  the /watchlist endpoints (CRUD; GET/PUT embed /stock snapshots)
+watchlist_store.py   WatchlistStore interface + InMemoryWatchlistStore (stdlib only)
+stores.py          the two in-memory store singletons shared by the routers
 rate_limit.py      SlidingWindowRateLimiter (stdlib only)
 tests/             offline suite + opt-in live tests
 EVALUATION.md      original project evaluation, yfinance option analysis, change history
-prior-changes/     before/after notes per round; start with SUMMARY-baseline-to-now.md
+prior-changes/     before/after notes per round; start with SUMMARY-baseline-to-now.md,
+                   then watchlist-users-changes.md (users, watchlists, dead code removed)
 ```

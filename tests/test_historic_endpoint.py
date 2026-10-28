@@ -7,6 +7,7 @@ test_window_rule.py.
 
 import json
 from datetime import timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -49,7 +50,7 @@ def _ohlc(bars: pd.DataFrame) -> dict:
     }
 
 
-def _spike(df: pd.DataFrame, ts: pd.Timestamp, *, high: float | None = None, low: float | None = None) -> None:
+def _spike(df: pd.DataFrame, ts: pd.Timestamp, *, high: Optional[float] = None, low: Optional[float] = None) -> None:
     if high is not None:
         df.loc[ts, "High"] = high
     if low is not None:
@@ -209,6 +210,33 @@ def test_fortnightly_records_aggregate_14_day_bins_anchored_at_the_newest_bar(cl
     assert _datetimes(result)[-1] == FRIDAY.isoformat()  # anchored at the newest bar
     assert _record(result, by_bin[3][-1].date().isoformat())["high"] == HIGH_SPIKE  # mid-bin high surfaces
     assert _record(result, by_bin[5][-1].date().isoformat())["low"] == LOW_SPIKE
+
+
+@pytest.mark.parametrize("reference", [FRIDAY, MONDAY, HOLIDAY, HOLIDAY + timedelta(days=4)], ids=["friday", "monday", "holiday", "after-holiday"])
+def test_year_last_record_equals_the_month_daily_bars_over_its_14_days(client, market, reference):
+    """Offline twin of the live test `test_live_aggregated_records_contain
+    _the_daily_extremes`: the YEAR's last fortnight record is the OHLC
+    aggregate of the daily bars (as MONTH serves them) of the 14 calendar
+    days ending on D' - whatever day D' lands on. Both windows are
+    anchored on the same date, as the live test must be: with a rolling
+    window the running session's bar changes between two live calls."""
+    year = only(get(client, "YEAR", reference).json())
+    end = year["window"]["end"]
+    month = only(get(client, "MONTH", end).json())
+    assert month["window"]["end"] == end
+
+    bin_start = (pd.Timestamp(end).date() - timedelta(days=13)).isoformat()
+    daily = [p for p in month["data"] if bin_start <= p["datetime"] <= end]
+    assert daily and daily[-1]["datetime"] == end
+    assert year["data"][-1] == {
+        "datetime": end,
+        "open": daily[0]["open"],
+        "high": max(p["high"] for p in daily),
+        "low": min(p["low"] for p in daily),
+        "close": daily[-1]["close"],
+    }
+    # and the record before it ends before the bin: nothing is counted twice
+    assert year["data"][-2]["datetime"] < bin_start
 
 
 def test_five_year_records_aggregate_calendar_months(client, market):

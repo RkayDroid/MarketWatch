@@ -549,6 +549,18 @@ def get_stock_snapshot(ticker: str):
     * Upstream cost: 2 requests per call (yfinance `.info` = quoteSummary
       + quote); 4 if a dotted symbol has to be retried in dash form.
     """
+    snapshot = fetch_snapshot(ticker)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"Ticker {ticker.upper()} not found.")
+    return snapshot
+
+
+def fetch_snapshot(ticker: str) -> Optional[dict]:
+    """The `/stock/{symbol}` snapshot for `ticker` (upper-cased), or None
+    when Yahoo knows no such symbol. Shared by the snapshot endpoint and
+    the watchlist view so both pay the same budget (2 calls, 4 with the
+    dash retry) and map upstream failures the same way: raises
+    HTTPException 429 (budget / Yahoo limiter) or 502 (anything else)."""
     ticker = ticker.upper()
 
     def fetch_info(symbol: str):
@@ -566,10 +578,7 @@ def get_stock_snapshot(ticker: str):
             return None
         return _build_snapshot(ticker, info)
 
-    snapshot = _upstream(fetch)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail=f"Ticker {ticker} not found.")
-    return snapshot
+    return _upstream(fetch)
 
 
 # ==========================================================================
