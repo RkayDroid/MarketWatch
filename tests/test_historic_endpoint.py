@@ -1,16 +1,27 @@
-"""Tests for GET /stock/{symbol}/historic?period=..."""
+"""Tests for GET /stock/{ticker}/historic - what the records contain:
+OHLC per bar, downsampling as OHLC aggregation, serialisation. The window
+rule (D' resolution, DAY/WEEK/calendar spans, referenceDate lists,
+validation, error mapping, dotted symbols) is covered in
+test_window_rule.py.
+"""
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+from typing import Optional
 
+import numpy as np
 import pandas as pd
 import pytest
-from yfinance.exceptions import YFException, YFRateLimitError
 
 import stock_router
-from tests.conftest import EXCHANGE_TZ, make_ohlc_frame
+from tests.conftest import EXCHANGE_TZ, make_market
+from tests.test_window_rule import FRIDAY, HOLIDAY, MONDAY, get, only, weekday_back
 
-EXPECTED_KEYS = {"ticker", "period", "interval", "count", "cached", "data"}
+RESPONSE_KEYS = {"ticker", "symbol", "period", "interval", "referenceDate", "window", "count", "data"}
+RECORD_KEYS = {"datetime", "open", "high", "low", "close"}
+# Planted extremes: the synthetic market's prices are ~100..25000.
+HIGH_SPIKE = 1_000_000.0
+LOW_SPIKE = 0.01
 
 
 def _strict_json(text: str):
@@ -20,250 +31,288 @@ def _strict_json(text: str):
     return json.loads(text, parse_constant=_reject)
 
 
-@pytest.fixture
-def daily_5y():
-    return make_ohlc_frame(periods=1300, freq="B", intraday=False, end=pd.Timestamp.now(tz=EXCHANGE_TZ).normalize())
+def _datetimes(result):
+    return [p["datetime"] for p in result["data"]]
 
 
-def _dates(body):
-    return [p["datetime"] for p in body["data"]]
+def _record(result, stamp_prefix: str) -> dict:
+    (match,) = [p for p in result["data"] if p["datetime"].startswith(stamp_prefix)]
+    return match
+
+
+def _ohlc(bars: pd.DataFrame) -> dict:
+    """The OHLC aggregate of a run of bars, rounded like the API."""
+    return {
+        "open": round(float(bars["Open"].iloc[0]), 4),
+        "high": round(float(bars["High"].max()), 4),
+        "low": round(float(bars["Low"].min()), 4),
+        "close": round(float(bars["Close"].iloc[-1]), 4),
+    }
+
+
+def _spike(df: pd.DataFrame, ts: pd.Timestamp, *, high: Optional[float] = None, low: Optional[float] = None) -> None:
+    if high is not None:
+        df.loc[ts, "High"] = high
+    if low is not None:
+        df.loc[ts, "Low"] = low
 
 
 # --------------------------------------------------------------------------
-# Contract
+# Response contract
 # --------------------------------------------------------------------------
-def test_default_period_is_day(client, fake_yfinance, hourly_30_bars):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars}
-
+def test_default_period_is_day_and_shape_is_exact(client, market):
     resp = client.get("/stock/aapl/historic")
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = _strict_json(resp.text)
-    assert set(body) == EXPECTED_KEYS
-    assert body["ticker"] == "AAPL"
-    assert body["period"] == "DAY"
-    assert body["interval"] == "1h"
+    assert set(body) == RESPONSE_KEYS
+    assert body["ticker"] == "AAPL" and body["symbol"] == "AAPL"
+    assert body["period"] == "DAY" and body["interval"] == "1h"
     assert body["count"] == len(body["data"])
-    assert body["cached"] is False
-    assert resp.headers["X-Cache"] == "MISS"
-    assert all(set(p) == {"datetime", "price"} for p in body["data"])
+    assert all(set(p) == RECORD_KEYS for p in body["data"])
+    assert all(isinstance(p[k], float) for p in body["data"] for k in ("open", "high", "low", "close"))
+    assert all(p["low"] <= min(p["open"], p["close"]) <= max(p["open"], p["close"]) <= p["high"] for p in body["data"])
 
 
 @pytest.mark.parametrize("raw", ["day", "Week", " MONTH "])
-def test_period_is_case_insensitive(client, fake_yfinance, hourly_30_bars, daily_5y, raw):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars, ("5y", "1d"): daily_5y}
+def test_period_is_case_insensitive(client, market, raw):
     resp = client.get(f"/stock/AAPL/historic?period={raw}")
     assert resp.status_code == 200
     assert resp.json()["period"] == raw.strip().upper()
 
 
-def test_invalid_period_is_422_without_upstream_call(client, fake_yfinance):
+@pytest.mark.parametrize(
+    "period,label", [("DAY", "1h"), ("WEEK", "1d"), ("MONTH", "1d"), ("HALF_YEAR", "2wk"), ("YEAR", "2wk"), ("FIVE_YEAR", "1mo")]
+)
+def test_interval_label_per_period(client, market, period, label):
+    assert client.get(f"/stock/AAPL/historic?period={period}").json()["interval"] == label
+
+
+# --------------------------------------------------------------------------
+# DAY: the hourly bars of the session
+# --------------------------------------------------------------------------
+def test_day_is_the_sessions_hourly_ohlc_bars_anchored_on_the_open(client, market):
+    result = only(get(client, "DAY", FRIDAY).json())
+
+    assert result["count"] == 7
+    assert [d[11:16] for d in _datetimes(result)] == ["09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
+    assert all(d.startswith(FRIDAY.isoformat()) for d in _datetimes(result))
+    assert all(d.endswith(("-04:00", "-05:00")) for d in _datetimes(result))  # exchange UTC offset kept
+    bars = market.bars("60m", FRIDAY, FRIDAY)
+    for record, (ts, bar) in zip(result["data"], bars.iterrows()):
+        assert record["datetime"] == ts.isoformat()
+        assert record == {"datetime": ts.isoformat(), **_ohlc(bars.loc[[ts]])}
+
+
+def test_day_includes_the_running_bar_while_the_market_is_open(client, fake_yfinance, clock):
+    wednesday = weekday_back(10, 2)
+    now = clock(pd.Timestamp(f"{wednesday} 13:00", tz=EXCHANGE_TZ))
+    market = make_market(now=now)
+    fake_yfinance.window_responses = market.respond
+
+    body = client.get("/stock/AAPL/historic?period=DAY").json()
+
+    assert [d[11:16] for d in _datetimes(body)] == ["09:30", "10:30", "11:30", "12:30"]  # 12:30 bar is running
+    assert body["data"][-1]["close"] == round(float(market.hourly["Close"].iloc[-1]), 4)
+
+
+def test_the_high_of_a_session_sits_in_the_hourly_bar_it_happened_in(client, market):
+    bars = market.bars("60m", FRIDAY, FRIDAY)
+    _spike(market.hourly, bars.index[3], high=HIGH_SPIKE)  # the 12:30 bar
+    _spike(market.hourly, bars.index[5], low=LOW_SPIKE)  # the 14:30 bar
+
+    result = only(get(client, "DAY", FRIDAY).json())
+
+    assert max(p["high"] for p in result["data"]) == HIGH_SPIKE
+    assert _record(result, f"{FRIDAY}T12:30")["high"] == HIGH_SPIKE
+    assert _record(result, f"{FRIDAY}T14:30")["low"] == LOW_SPIKE
+    assert _record(result, f"{FRIDAY}T12:30")["close"] < HIGH_SPIKE  # the close is still the close
+
+
+def test_day_ignores_the_neighbouring_sessions(client, market):
+    wednesday = weekday_back(20, 2)
+    if wednesday == HOLIDAY:
+        wednesday -= timedelta(days=7)
+    before = market.bars("60m", wednesday - timedelta(days=1), wednesday - timedelta(days=1))
+    after = market.bars("60m", wednesday + timedelta(days=1), wednesday + timedelta(days=1))
+    _spike(market.hourly, before.index[-1], high=HIGH_SPIKE, low=LOW_SPIKE)  # 15:30 the day before
+    _spike(market.hourly, after.index[0], high=HIGH_SPIKE, low=LOW_SPIKE)  # 09:30 the day after
+
+    result = only(get(client, "DAY", wednesday).json())
+
+    assert max(p["high"] for p in result["data"]) < HIGH_SPIKE
+    assert min(p["low"] for p in result["data"]) > LOW_SPIKE
+
+
+# --------------------------------------------------------------------------
+# Daily periods: one record per trading day, then downsampled as OHLC
+# --------------------------------------------------------------------------
+def test_week_is_one_ohlc_record_per_session(client, market):
+    result = only(get(client, "WEEK", FRIDAY).json())
+
+    sessions = market.sessions_on_or_before(FRIDAY)[-5:]
+    assert _datetimes(result) == [s.isoformat() for s in sessions]
+    for record, s in zip(result["data"], sessions):
+        assert record == {"datetime": s.isoformat(), **_ohlc(market.bars("1d", s, s))}
+
+
+def test_week_ignores_the_sixth_session_back_and_the_next_session(client, market):
+    sessions = market.sessions_on_or_before(FRIDAY)
+    sixth_back, next_session = sessions[-6], [s for s in market.sessions if s > FRIDAY][0]
+    _spike(market.daily, market.bars("1d", sixth_back, sixth_back).index[0], high=HIGH_SPIKE)
+    _spike(market.daily, market.bars("1d", next_session, next_session).index[0], high=HIGH_SPIKE)
+    _spike(market.daily, market.bars("1d", sessions[-5], sessions[-5]).index[0], low=LOW_SPIKE)  # first session IN the window
+
+    result = only(get(client, "WEEK", FRIDAY).json())
+
+    assert max(p["high"] for p in result["data"]) < HIGH_SPIKE
+    assert result["data"][0]["low"] == LOW_SPIKE
+
+
+def test_month_is_one_record_per_session_in_30_days_and_includes_its_first_day_only(client, market):
+    start = MONDAY - timedelta(days=29)  # a Sunday -> the first session in the window is the Monday after
+    first_session = [s for s in market.sessions if s >= start][0]
+    day_before = [s for s in market.sessions if s < start][-1]
+    _spike(market.daily, market.bars("1d", first_session, first_session).index[0], high=HIGH_SPIKE)
+    _spike(market.daily, market.bars("1d", day_before, day_before).index[0], low=LOW_SPIKE)
+
+    result = only(get(client, "MONTH", MONDAY).json())
+
+    expected = market.bars("1d", start, MONDAY)
+    assert 20 <= result["count"] <= 23
+    assert _datetimes(result) == [ts.date().isoformat() for ts in expected.index]
+    assert result["data"][0]["high"] == HIGH_SPIKE
+    assert min(p["low"] for p in result["data"]) > LOW_SPIKE
+
+
+@pytest.mark.parametrize("period,days,expected_records", [("HALF_YEAR", 182, 13), ("YEAR", 365, 26)])
+def test_fortnightly_records_aggregate_14_day_bins_anchored_at_the_newest_bar(client, market, period, days, expected_records):
+    window = market.bars("1d", FRIDAY - timedelta(days=days - 1), FRIDAY)
+    # plant a high mid-bin (not on a bin's last day) and a low on a bin's first day
+    by_bin = {}
+    for ts in window.index:
+        by_bin.setdefault((FRIDAY - ts.date()).days // 14, []).append(ts)
+    mid_bin = by_bin[3][len(by_bin[3]) // 2]
+    first_of_bin = by_bin[5][0]
+    _spike(market.daily, mid_bin, high=HIGH_SPIKE)
+    _spike(market.daily, first_of_bin, low=LOW_SPIKE)
+    window = market.bars("1d", FRIDAY - timedelta(days=days - 1), FRIDAY)
+
+    result = only(get(client, period, FRIDAY).json())
+
+    assert expected_records <= result["count"] <= expected_records + 1
+    # one record per bin, stamped with the bin's last session, OHLC aggregated over the bin
+    expected = []
+    for key in sorted(by_bin, reverse=True):
+        bars = window.loc[by_bin[key]]
+        expected.append({"datetime": by_bin[key][-1].date().isoformat(), **_ohlc(bars)})
+    assert result["data"] == expected
+    assert _datetimes(result)[-1] == FRIDAY.isoformat()  # anchored at the newest bar
+    assert _record(result, by_bin[3][-1].date().isoformat())["high"] == HIGH_SPIKE  # mid-bin high surfaces
+    assert _record(result, by_bin[5][-1].date().isoformat())["low"] == LOW_SPIKE
+
+
+@pytest.mark.parametrize("reference", [FRIDAY, MONDAY, HOLIDAY, HOLIDAY + timedelta(days=4)], ids=["friday", "monday", "holiday", "after-holiday"])
+def test_year_last_record_equals_the_month_daily_bars_over_its_14_days(client, market, reference):
+    """Offline twin of the live test `test_live_aggregated_records_contain
+    _the_daily_extremes`: the YEAR's last fortnight record is the OHLC
+    aggregate of the daily bars (as MONTH serves them) of the 14 calendar
+    days ending on D' - whatever day D' lands on. Both windows are
+    anchored on the same date, as the live test must be: with a rolling
+    window the running session's bar changes between two live calls."""
+    year = only(get(client, "YEAR", reference).json())
+    end = year["window"]["end"]
+    month = only(get(client, "MONTH", end).json())
+    assert month["window"]["end"] == end
+
+    bin_start = (pd.Timestamp(end).date() - timedelta(days=13)).isoformat()
+    daily = [p for p in month["data"] if bin_start <= p["datetime"] <= end]
+    assert daily and daily[-1]["datetime"] == end
+    assert year["data"][-1] == {
+        "datetime": end,
+        "open": daily[0]["open"],
+        "high": max(p["high"] for p in daily),
+        "low": min(p["low"] for p in daily),
+        "close": daily[-1]["close"],
+    }
+    # and the record before it ends before the bin: nothing is counted twice
+    assert year["data"][-2]["datetime"] < bin_start
+
+
+def test_five_year_records_aggregate_calendar_months(client, market):
+    result = only(get(client, "FIVE_YEAR", FRIDAY).json())
+
+    assert 60 <= result["count"] <= 61
+    months = [d[:7] for d in _datetimes(result)]
+    assert len(set(months)) == len(months)  # one per month
+    assert _datetimes(result)[-1] == FRIDAY.isoformat()  # current (partial) month = up to its latest close
+    window = market.bars("1d", FRIDAY - timedelta(days=5 * 365 + 1), FRIDAY)
+    for record in result["data"]:
+        month_bars = window[window.index.strftime("%Y-%m") == record["datetime"][:7]]
+        assert record == {"datetime": month_bars.index[-1].date().isoformat(), **_ohlc(month_bars)}
+        d = pd.Timestamp(record["datetime"]).date()
+        if record is not result["data"][-1]:
+            assert [s for s in market.sessions if s > d][0].month != d.month  # the month's last session
+
+
+def test_daily_records_carry_a_date_only(client, market):
+    body = client.get("/stock/AAPL/historic?period=MONTH").json()
+    assert all(len(p["datetime"]) == 10 and p["datetime"].count("-") == 2 for p in body["data"])
+
+
+# --------------------------------------------------------------------------
+# NaN handling
+# --------------------------------------------------------------------------
+def test_bars_without_a_close_are_skipped_and_missing_fields_are_null(client, market):
+    bars = market.bars("60m", FRIDAY, FRIDAY)
+    market.hourly.loc[bars.index[:2], "Close"] = np.nan  # 09:30, 10:30 unusable
+    market.hourly.loc[bars.index[3], "High"] = np.nan  # 12:30 has no High
+
+    resp = get(client, "DAY", FRIDAY)
+
+    result = only(_strict_json(resp.text))  # NaN must not leak into JSON
+    assert [d[11:16] for d in _datetimes(result)] == ["11:30", "12:30", "13:30", "14:30", "15:30"]
+    assert _record(result, f"{FRIDAY}T12:30")["high"] is None
+    assert _record(result, f"{FRIDAY}T12:30")["close"] is not None
+
+
+def test_nan_bars_inside_a_bin_are_skipped_in_the_aggregate(client, market):
+    window = market.bars("1d", FRIDAY - timedelta(days=181), FRIDAY)
+    market.daily.loc[window.index[-2], ["Open", "High", "Low", "Close"]] = np.nan  # the session before FRIDAY
+
+    result = only(get(client, "HALF_YEAR", FRIDAY).json())
+
+    last_bin = market.bars("1d", FRIDAY - timedelta(days=13), FRIDAY).drop(window.index[-2])
+    assert result["data"][-1] == {"datetime": FRIDAY.isoformat(), **_ohlc(last_bin)}
+
+
+def test_all_nan_window_is_404_not_500(client, market):
+    bars = market.bars("60m", FRIDAY, FRIDAY)
+    market.hourly.loc[bars.index, ["Open", "High", "Low", "Close"]] = np.nan
+
+    assert get(client, "DAY", FRIDAY).status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Misc
+# --------------------------------------------------------------------------
+def test_invalid_period_is_422_without_upstream_call(client, market):
     before = stock_router._limiter.remaining()
+
     resp = client.get("/stock/AAPL/historic?period=DECADE")
+
     assert resp.status_code == 422
-    assert fake_yfinance.calls == []
+    detail = json.dumps(resp.json())
+    for allowed in ("DAY", "WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
+        assert allowed in detail
+    assert stock_router.yf.Ticker.calls == []
     assert stock_router._limiter.remaining() == before
 
 
-# --------------------------------------------------------------------------
-# DAY: last 24h, one record per hour
-# --------------------------------------------------------------------------
-def test_day_returns_only_bars_within_last_24h_in_order(client, fake_yfinance, hourly_30_bars):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars}
-
-    body = client.get("/stock/AAPL/historic?period=DAY").json()
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    stamps = [datetime.fromisoformat(d) for d in _dates(body)]
-    assert all(ts >= cutoff for ts in stamps)
-    assert 24 <= len(stamps) <= 25
-    assert stamps == sorted(stamps)
-    assert all(ts.tzinfo is not None for ts in stamps)
-    assert body["data"][-1]["price"] == pytest.approx(round(float(hourly_30_bars["Close"].iloc[-1]), 4))
-    assert fake_yfinance.calls == [{"symbol": "AAPL", "period": "2d", "interval": "60m"}]
+def test_historic_route_does_not_shadow_other_ticker_routes(client, market):
+    assert client.get("/stock/AAPL/history").status_code == 404
 
 
-def test_day_falls_back_to_5d_when_2d_is_empty(client, fake_yfinance, hourly_30_bars):
-    fake_yfinance.responses = {("5d", "60m"): hourly_30_bars}
-    before = stock_router._limiter.remaining()
-
-    resp = client.get("/stock/AAPL/historic?period=DAY")
-
-    assert resp.status_code == 200
-    assert [c["period"] for c in fake_yfinance.calls] == ["2d", "5d"]
-    assert before - stock_router._limiter.remaining() == 2
-
-
-def test_day_returns_last_24_bars_when_market_closed_over_24h(client, fake_yfinance, stale_hourly_bars):
-    fake_yfinance.responses = {("2d", "60m"): stale_hourly_bars}
-
-    body = client.get("/stock/AAPL/historic?period=DAY").json()
-
-    assert body["count"] == 24
-    assert datetime.fromisoformat(body["data"][-1]["datetime"]) < datetime.now(timezone.utc) - timedelta(hours=24)
-
-
-def test_day_skips_nan_close_bars(client, fake_yfinance):
-    df = make_ohlc_frame(periods=10, freq="h")
-    df.iloc[-1, df.columns.get_loc("Close")] = float("nan")
-    fake_yfinance.responses = {("2d", "60m"): df}
-
-    body = _strict_json(client.get("/stock/AAPL/historic?period=DAY").text)
-
-    assert body["count"] == 9
-
-
-# --------------------------------------------------------------------------
-# WEEK / MONTH: one record per trading day
-# --------------------------------------------------------------------------
-def test_week_is_last_7_days_one_record_per_trading_day(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-
-    body = client.get("/stock/AAPL/historic?period=WEEK").json()
-
-    assert body["interval"] == "1d"
-    cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=7)
-    expected = daily_5y[daily_5y.index >= cutoff]
-    assert _dates(body) == [ts.date().isoformat() for ts in expected.index]
-    assert [p["price"] for p in body["data"]] == [round(float(c), 4) for c in expected["Close"]]
-    assert 4 <= body["count"] <= 6  # 7 calendar days = ~5 trading days
-    assert len(_dates(body)) == len(set(_dates(body)))  # one per day
-
-
-def test_month_is_last_30_days_one_record_per_trading_day(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-
-    body = client.get("/stock/AAPL/historic?period=MONTH").json()
-
-    assert body["interval"] == "1d"
-    cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=30)
-    expected = daily_5y[daily_5y.index >= cutoff]
-    assert body["count"] == len(expected)
-    assert 20 <= body["count"] <= 23
-    assert _dates(body)[-1] == daily_5y.index[-1].date().isoformat()
-
-
-# --------------------------------------------------------------------------
-# HALF_YEAR / YEAR: one record per fortnight
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("period,days,expected_records", [("HALF_YEAR", 182, 13), ("YEAR", 365, 26)])
-def test_fortnightly_periods(client, fake_yfinance, daily_5y, period, days, expected_records):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-
-    body = client.get(f"/stock/AAPL/historic?period={period}").json()
-
-    assert body["interval"] == "2wk"
-    # ~one record per 14 days (+1 for a possible partial bin at the old end)
-    assert expected_records <= body["count"] <= expected_records + 1
-
-    stamps = [pd.Timestamp(d) for d in _dates(body)]
-    assert stamps == sorted(stamps)
-    gaps = [(b - a).days for a, b in zip(stamps, stamps[1:])]
-    assert all(12 <= g <= 16 for g in gaps[1:]), f"records should be ~14 days apart, got {gaps}"
-
-    # Latest record is the most recent close; each record is a real trading day's close.
-    assert _dates(body)[-1] == daily_5y.index[-1].date().isoformat()
-    assert body["data"][-1]["price"] == round(float(daily_5y["Close"].iloc[-1]), 4)
-    closes_by_date = {ts.date().isoformat(): round(float(c), 4) for ts, c in daily_5y["Close"].items()}
-    assert all(closes_by_date[p["datetime"]] == p["price"] for p in body["data"])
-
-    # Everything lies inside the look-back window.
-    cutoff = (pd.Timestamp.now(tz="UTC") - timedelta(days=days)).date().isoformat()
-    assert all(d >= cutoff for d in _dates(body))
-
-
-# --------------------------------------------------------------------------
-# FIVE_YEAR: one record per calendar month
-# --------------------------------------------------------------------------
-def test_five_year_is_one_record_per_calendar_month(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-
-    body = client.get("/stock/AAPL/historic?period=FIVE_YEAR").json()
-
-    assert body["interval"] == "1mo"
-    months = [d[:7] for d in _dates(body)]
-    assert len(months) == len(set(months)), "exactly one record per month"
-    assert 59 <= body["count"] <= 62
-    # Each record is the last trading day of its month (month-end close).
-    last_per_month = daily_5y.groupby(daily_5y.index.strftime("%Y-%m")).tail(1)
-    assert _dates(body) == [ts.date().isoformat() for ts in last_per_month.index]
-    assert [p["price"] for p in body["data"]] == [round(float(c), 4) for c in last_per_month["Close"]]
-
-
-# --------------------------------------------------------------------------
-# Budget: shared daily frame
-# --------------------------------------------------------------------------
-def test_all_long_periods_share_one_upstream_call(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-    before = stock_router._limiter.remaining()
-
-    headers = {}
-    for p in ("WEEK", "MONTH", "HALF_YEAR", "YEAR", "FIVE_YEAR"):
-        r = client.get(f"/stock/AAPL/historic?period={p}")
-        assert r.status_code == 200
-        headers[p] = r.headers["X-Cache"]
-
-    assert fake_yfinance.calls == [{"symbol": "AAPL", "period": "5y", "interval": "1d"}]
-    assert before - stock_router._limiter.remaining() == 1
-    assert headers == {"WEEK": "MISS", "MONTH": "MEMORY", "HALF_YEAR": "MEMORY", "YEAR": "MEMORY", "FIVE_YEAR": "MEMORY"}
-
-
-def test_daily_frame_is_shared_with_highlow_endpoint(client, fake_yfinance, daily_5y):
-    fake_yfinance.responses = {("5y", "1d"): daily_5y}
-
-    assert client.get("/stock/AAPL/historic?period=YEAR").status_code == 200
-    resp = client.get("/stock/AAPL/highlow?period=FIVE_YEAR")
-
-    assert resp.status_code == 200
-    assert resp.headers["X-Cache"] == "MEMORY"
-    assert len(fake_yfinance.calls) == 1
-
-
-def test_day_cache_expires_after_ttl(client, fake_yfinance, hourly_30_bars, monkeypatch):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars}
-    clock = {"t": 1_000_000.0}
-    monkeypatch.setattr(stock_router._cache.memory, "_now", lambda: clock["t"])
-    monkeypatch.setattr(stock_router._cache.disk, "_now", lambda: clock["t"])
-
-    client.get("/stock/AAPL/historic")
-    clock["t"] += stock_router._cache.ttl_seconds + 1
-    resp = client.get("/stock/AAPL/historic")
-
-    assert resp.json()["cached"] is False
-    assert resp.headers["X-Cache"] == "MISS"
-    assert len(fake_yfinance.calls) == 2
-
-
-# --------------------------------------------------------------------------
-# Errors
-# --------------------------------------------------------------------------
-def test_404_when_no_data(client, fake_yfinance):
-    fake_yfinance.responses = {}
-    assert client.get("/stock/NOPE/historic?period=DAY").status_code == 404
-    assert client.get("/stock/NOPE/historic?period=YEAR").status_code == 404
-
-
-def test_429_when_local_budget_exhausted_but_cached_still_served(client, fake_yfinance, hourly_30_bars, monkeypatch):
-    fake_yfinance.responses = {("2d", "60m"): hourly_30_bars}
-    monkeypatch.setattr(stock_router._limiter, "max_calls", 1)
-
-    assert client.get("/stock/AAPL/historic").status_code == 200
-    assert client.get("/stock/MSFT/historic").status_code == 429
-    assert client.get("/stock/AAPL/historic").headers["X-Cache"] == "MEMORY"
-
-
-def test_yahoo_rate_limit_maps_to_429(client, fake_yfinance):
-    fake_yfinance.raise_on_history = YFRateLimitError()
-    assert client.get("/stock/AAPL/historic").status_code == 429
-
-
-def test_yfinance_error_maps_to_502(client, fake_yfinance):
-    fake_yfinance.raise_on_history = YFException("Yahoo is down")
-    resp = client.get("/stock/AAPL/historic?period=MONTH")
-    assert resp.status_code == 502
-    assert "Yahoo is down" in resp.json()["detail"]
-
-
-def test_unexpected_exception_maps_to_502_not_500(client, fake_yfinance):
-    fake_yfinance.raise_on_history = KeyError("Close")
-    assert client.get("/stock/AAPL/historic").status_code == 502
+def test_the_exchanges_today_is_reported_as_the_rolling_reference_date(client, market):
+    expected = pd.Timestamp.now(tz=EXCHANGE_TZ).date().isoformat()
+    assert client.get("/stock/AAPL/historic").json()["referenceDate"] == expected
